@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+.Python
+.venv/
+venv/
+.env
+
+# Build artifacts (rebuild from the source XML dump)
+helloproject.db
+helloproject.db-shm
+helloproject.db-wal
+chroma/
+build.log
+build_emb.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

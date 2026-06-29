@@ -347,107 +347,6 @@ def format_prior_turns_for_llm(
 
 
 # ---------------------------------------------------------------------------
-# Pronoun substitution
-# ---------------------------------------------------------------------------
-
-# Pronouns that map to the last singular entity in context.
-SINGULAR_PRONOUNS = {"it", "this", "that"}
-PLURAL_PRONOUNS = {"they", "them", "their"}
-
-
-def substitute_pronouns(question: str, ctx: Context) -> tuple[str, str | None]:
-    """Replace ambiguous pronouns in the question with the remembered entity.
-
-    Returns (rewritten_question, note). The note is a short string
-    explaining what we substituted (or None if no substitution was
-    done). Callers can use the note to inform the user.
-
-    Conservative: only the most unambiguous pronouns are replaced. If
-    the context has no remembered entity, we do nothing.
-    """
-    words = question.split()
-    new_words = []
-    note = None
-    substituted = False
-
-    for w in words:
-        # Strip punctuation for matching but preserve it in output.
-        bare = w.strip(".,?!;:")
-        punc = w[len(bare):]
-        lower = bare.lower()
-
-        if lower in SINGULAR_PRONOUNS and ctx.last_singular_title:
-            replacement = ctx.last_singular_title
-            new_words.append(replacement + punc)
-            substituted = True
-            note = f"(interpreted '{bare}' as '{replacement}')"
-        elif lower in PLURAL_PRONOUNS and ctx.artist_title:
-            replacement = ctx.artist_title
-            new_words.append(replacement + punc)
-            substituted = True
-            note = f"(interpreted '{bare}' as '{replacement}')"
-        else:
-            new_words.append(w)
-
-    if not substituted:
-        return question, None
-    return " ".join(new_words), note
-
-
-# ---------------------------------------------------------------------------
-# Argument preservation
-# ---------------------------------------------------------------------------
-
-def preserve_arguments(
-    question: str,
-    ctx: Context,
-) -> tuple[str, str | None]:
-    """If the question is missing the artist/track context, fill it in
-    from the conversation context.
-
-    This is a heuristic — we only inject the artist if the question
-    clearly doesn't name one. We detect that by trying to extract an
-    artist from the question itself (via a simple Capitalized-Phrase
-    heuristic). If we can't find one and the context has a remembered
-    artist, we prepend it.
-
-    Returns (rewritten_question, note).
-    """
-    # Cheap heuristic: a Capitalized phrase is likely an artist name.
-    # Look for any title-cased multi-word sequence.
-    has_capitalized_phrase = bool(re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b", question))
-
-    # Heuristic: if the question starts with "what about", "and", or
-    # "what about the X", the user is clearly following up on the
-    # prior context.
-    is_followup_start = bool(re.match(
-        r"^\s*(what about|how about|and\b|also,?|and how about)",
-        question, re.IGNORECASE,
-    ))
-
-    # If the question explicitly references a known context entity by
-    # name, we don't need to do anything.
-    mentions_known = False
-    if ctx.artist_title and ctx.artist_title.lower() in question.lower():
-        mentions_known = True
-    if ctx.album_title and ctx.album_title.lower() in question.lower():
-        mentions_known = True
-    if ctx.song_title and ctx.song_title.lower() in question.lower():
-        mentions_known = True
-
-    if mentions_known or ctx.artist_title is None:
-        return question, None
-
-    if is_followup_start or not has_capitalized_phrase:
-        # Inject the remembered artist into the question.
-        injected = f"In {ctx.artist_title}, {question.lstrip().rstrip('?.')}"
-        note = f"(interpreted as a question about {ctx.artist_title})"
-        return injected + "?", note
-
-    return question, None
-
-
-# ---------------------------------------------------------------------------
 # Command parsing
 # ---------------------------------------------------------------------------
 
@@ -513,36 +412,9 @@ BARE_NOUN_QUERIES = {
     "facts":      ("artist", "What are some facts about {entity}?"),
 }
 
-# Temporal/ordinal references that should be resolved against context.
-# These get rewritten to concrete phrases before classification.
-#
-# Year-anchored patterns use {next_year} / {prev_year} placeholders,
-# which are substituted with the actual year (e.g., "2011" if the
-# prior question was about 2010). Album-anchored patterns use
-# {last_album} which is bound from the Context's album_title.
-TEMPORAL_PATTERNS = [
-    # "the next year" / "the following year" -> "in 2011" (or "the year after" if no prior year)
-    (r"\bthe\s+next\s+year\b", "{next_year}"),
-    (r"\bthe\s+following\s+year\b", "{next_year}"),
-    (r"\bthe\s+previous\s+year\b", "{prev_year}"),
-    (r"\bthe\s+year\s+before\b", "{prev_year}"),
-    # "the next album" / "the previous single"
-    (r"\bthe\s+next\s+(album|single|release)\b", "the {1} after {last_album}"),
-    (r"\bthe\s+previous\s+(album|single|release)\b", "the {1} before {last_album}"),
-]
-
-
-# Pattern for finding a 4-digit year in [1900, 2099] in text.
-YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
-
-
-def extract_year(text: str) -> int | None:
-    """Pull the first plausible year (1900-2099) out of text, if any."""
-    if not text:
-        return None
-    m = YEAR_RE.search(text)
-    return int(m.group(1)) if m else None
-
+# ---------------------------------------------------------------------------
+# High-level: prepare a question for the classifier
+# ---------------------------------------------------------------------------
 
 @dataclass
 class FollowupDecision:
@@ -605,72 +477,6 @@ def expand_bare_noun(
     return template.format(entity=entity), f"(expanded '{question}' to ask about {entity})"
 
 
-def resolve_temporal(
-    question: str,
-    ctx: Context,
-    prior_year: int | None = None,
-) -> tuple[str, str | None]:
-    """Resolve 'next year', 'previous album', etc. into concrete phrases.
-
-    Year references ('the next year', 'the previous year') are rewritten
-    to specific years when we know the prior year. For example, if the
-    prior question was about 2010, 'the next year' becomes 'in 2011'.
-    This is much more useful than 'the year after' because the rewritten
-    question is specific enough that semantic search finds relevant
-    content and the LLM doesn't have to guess.
-
-    Album references ('the next album', 'the previous single') get
-    substituted with the last album title from context.
-
-    Returns (rewritten_question, note).
-    """
-    notes: list[str] = []
-    q = question
-
-    for pattern, replacement in TEMPORAL_PATTERNS:
-        m = re.search(pattern, q, re.IGNORECASE)
-        if not m:
-            continue
-
-        new_replacement = replacement
-        # Substitute the captured group (e.g., "album" in
-        # "the next album") into "{1}".
-        if "{1}" in new_replacement and m.group(1):
-            new_replacement = new_replacement.replace("{1}", m.group(1))
-
-        # Year placeholders: only fill if we know the prior year.
-        if "{next_year}" in new_replacement:
-            if prior_year is not None:
-                next_y = prior_year + 1
-                new_replacement = new_replacement.replace("{next_year}", f"in {next_y}")
-                notes.append(f"(resolved 'next year' to {next_y} from prior {prior_year})")
-            else:
-                # Fall back to the abstract phrase; the LLM will have
-                # to figure it out from conversation context.
-                new_replacement = new_replacement.replace("{next_year}", "the year after")
-        if "{prev_year}" in new_replacement:
-            if prior_year is not None:
-                prev_y = prior_year - 1
-                new_replacement = new_replacement.replace("{prev_year}", f"in {prev_y}")
-                notes.append(f"(resolved 'previous year' to {prev_y} from prior {prior_year})")
-            else:
-                new_replacement = new_replacement.replace("{prev_year}", "the year before")
-
-        # Album placeholders.
-        if "{last_album}" in new_replacement:
-            if ctx.album_title:
-                new_replacement = new_replacement.replace("{last_album}", ctx.album_title)
-                notes.append(f"(bound 'previous/next album' to '{ctx.album_title}')")
-            else:
-                new_replacement = new_replacement.replace("{last_album}", "the previous release")
-
-        q = re.sub(pattern, new_replacement, q, flags=re.IGNORECASE)
-
-    if q != question:
-        return q, (" ".join(notes) if notes else None)
-    return question, None
-
-
 # ---------------------------------------------------------------------------
 # High-level: prepare a question for the classifier
 # ---------------------------------------------------------------------------
@@ -723,45 +529,5 @@ def prepare_followup(
             )
 
     return FollowupDecision("new_question", q, "")
-
-
-def prepare_question(
-    question: str,
-    ctx: Context,
-    verbose: bool = False,
-    prior_year: int | None = None,
-) -> tuple[str, list[str]]:
-    """Rewrite a raw user question using conversation context.
-
-    Returns (rewritten_question, notes). The notes list contains
-    human-readable strings describing each substitution, suitable for
-    printing to stderr.
-
-    prior_year: if the prior user turn mentioned a year (e.g. 2010),
-    pass it so temporal references like 'the next year' can be
-    resolved to a specific year ('in 2011') instead of the abstract
-    phrase 'the year after'.
-    """
-    notes: list[str] = []
-    q = question
-
-    # Step 0: temporal/ordinal resolution (e.g. "next year" -> "in 2011")
-    q, note = resolve_temporal(q, ctx, prior_year=prior_year)
-    if note:
-        notes.append(note)
-
-    # Step 1: pronoun substitution (e.g. "it" -> "CRAZY ABOUT YOU")
-    q, note = substitute_pronouns(q, ctx)
-    if note:
-        notes.append(note)
-
-    # Step 2: argument preservation (e.g. "what about singles?" -> "In Morning Musume, what about singles?")
-    q, note = preserve_arguments(q, ctx)
-    if note:
-        notes.append(note)
-
-    if verbose and notes:
-        for n in notes:
-            print(f"[context] {n}", file=sys.stderr)
 
     return q, notes

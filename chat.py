@@ -818,43 +818,26 @@ def answer_question(
     chroma_dir: Path,
     verbose: bool = False,
     llm: "LLMSynthesizer | None" = None,
-    context: "Context | None" = None,
     on_tool_complete: "callable | None" = None,
-    prior_year: int | None = None,
     prior_turns_str: str | None = None,
     use_llm_tool_fallback: bool = True,
 ) -> str:
     """Answer a single question end-to-end.
 
-    If `context` is provided (a `conversation.Context` instance), the
-    question will be rewritten using remembered entities before the
-    classifier runs.
-
-    If `prior_year` is provided, temporal references like 'the next
-    year' will be rewritten to specific years (e.g., 'in 2011') using
-    prior_year as the anchor.
+    The question is passed verbatim to the classifier and (if needed)
+    to the LLM tool-use fallback. The LLM, with prior-turn context
+    (when `prior_turns_str` is provided), handles pronoun resolution,
+    year arithmetic, bare-noun expansion, and argument binding.
 
     If `use_llm_tool_fallback` is True and the regex classifier falls
     through to the default semantic_search, we ask the LLM (via the
     Anthropic tool-use API) to pick a structured tool. The LLM's
-    choice is validated and used. This is Phase 1 of the LLM-tool
-    integration plan.
+    choice is validated and used.
 
     If `on_tool_complete` is provided, it will be called as
     `on_tool_complete(tool_call, tool_result, answer)` after the tool
     executes but before synthesis. Used by the REPL to record turns
     """
-    notes: list[str] = []
-    if context is not None:
-        try:
-            from conversation import prepare_question
-            question, notes = prepare_question(
-                question, context, verbose=verbose, prior_year=prior_year,
-            )
-        except Exception as e:
-            if verbose:
-                print(f"[context] prepare failed: {e}", file=sys.stderr)
-
     if verbose:
         print(f"[classify] question={question!r}", file=sys.stderr)
 
@@ -1104,20 +1087,6 @@ def main() -> int:
                 # phrases ('the year after').
                 #
                 # Walk back through turns to find the most recent user
-                # turn before the current one. We can't just look at
-                # `conv.turns[-2]` because each prior turn is an
-                # interleaved user+assistant pair.
-                prior_year = None
-                if conv is not None and len(conv.turns) >= 2:
-                    try:
-                        from conversation import extract_year
-                        for prior_turn in reversed(conv.turns[:-1]):
-                            if prior_turn.role == "user":
-                                prior_year = extract_year(prior_turn.content)
-                                break
-                    except Exception:
-                        prior_year = None
-
                 def record_turn(call, result):
                     if not conv:
                         return
@@ -1129,9 +1098,8 @@ def main() -> int:
 
                 answer = answer_question(
                     question_to_classify, db_path, chroma_dir,
-                    verbose=args.verbose, llm=llm, context=ctx,
+                    verbose=args.verbose, llm=llm,
                     on_tool_complete=record_turn,
-                    prior_year=prior_year,
                     prior_turns_str=prior_turns_str,
                     use_llm_tool_fallback=not args.no_tool_llm,
                 )

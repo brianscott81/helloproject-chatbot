@@ -19,9 +19,16 @@ primary_region = 'iad'
 [[services]]
   protocol = 'tcp'
   internal_port = 8000
-  auto_stop_machines = 'stop'
-  auto_start_machines = true
-  min_machines_running = 0
+  # Keep the VM running at all times. With min_machines_running=0
+  # (the Fly.io default), Fly.io auto-stops the VM when it's
+  # idle for a few minutes and auto-starts it on the next request.
+  # This is cost-effective on the free tier but the first request
+  # after idle takes 3-5 seconds. Setting min_machines_running=1
+  # keeps the VM always warm at the cost of continuous free-tier
+  # usage (still $0 on Fly.io's free tier).
+  auto_stop_machines = 'off'
+  auto_start_machines = false
+  min_machines_running = 1
   processes = ['app']
 
   [[services.ports]]

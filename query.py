@@ -214,6 +214,7 @@ def find_album_for_artist(
     artist_page: Page,
     position: int | None = None,
     kind: str = "album",
+    year: int | None = None,
 ) -> list[AlbumMatch]:
     """Find albums/singles by a given artist.
 
@@ -224,6 +225,11 @@ def find_album_for_artist(
     Each match gets an album_number assigned by its 1-indexed position
     in this sorted list. The Last/Next infobox fields are also exposed
     in case the caller wants to verify.
+
+    If year is given, only releases whose release_date starts with
+    that year (e.g. "2001-02-21") are kept. Releases whose release_date
+    starts with just "2001" (year only) are also kept. Releases with
+    no parseable date are dropped when year is given.
 
     Returns a list (may be empty).
     """
@@ -263,6 +269,15 @@ def find_album_for_artist(
 
         # Build AlbumMatch
         disco = _extract_discography_fields(conn, page.id)
+        release_date = disco.get("release_date")
+
+        # Year filter: if specified, only keep releases whose date
+        # starts with the year. Release dates look like "2001-02-21"
+        # or just "2001" (year only).
+        if year is not None:
+            if not release_date or not release_date.startswith(str(year)):
+                continue
+
         track_count = conn.execute(
             "SELECT COUNT(*) FROM tracklists WHERE page_id=? AND is_karaoke=0",
             (page.id,),
@@ -270,7 +285,7 @@ def find_album_for_artist(
         matches.append(AlbumMatch(
             page=page,
             album_number=None,  # assigned below
-            release_date=disco.get("release_date"),
+            release_date=release_date,
             last_album=disco.get("last_target"),
             next_album=disco.get("next_target"),
             track_count=track_count,
@@ -287,6 +302,21 @@ def find_album_for_artist(
         m.album_number = i
 
     return matches
+
+
+def get_tracklist_for_title(
+    conn: sqlite3.Connection,
+    release_title: str,
+) -> list[Track]:
+    """Resolve a release title to a page and return its tracklist.
+
+    Returns an empty list if the title doesn't resolve or the page
+    has no tracklist.
+    """
+    page, _ = resolve_title_with_aliases(conn, release_title)
+    if not page:
+        return []
+    return get_tracklist(conn, page.id)
 
 
 def _extract_discography_fields(conn: sqlite3.Connection, page_id: int) -> dict:

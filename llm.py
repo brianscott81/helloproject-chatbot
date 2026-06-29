@@ -600,9 +600,10 @@ TOOL_SCHEMAS: list[dict] = [
     {
         "name": "list_releases",
         "description": (
-            "List all albums or singles by an artist. Use for 'list all "
-            "albums by X', 'what singles did X release', or 'show me X's "
-            "discography'. Returns a chronological list with release dates."
+            "List albums or singles by an artist, optionally filtered to a "
+            "specific year. Use for 'list all albums by X', 'what singles "
+            "did X release', 'show me X's discography', or 'X's 2001 "
+            "singles'. Returns a chronological list with release dates."
         ),
         "input_schema": {
             "type": "object",
@@ -616,8 +617,39 @@ TOOL_SCHEMAS: list[dict] = [
                     "enum": ["album", "single"],
                     "description": "Which type of release to list. Default 'album'.",
                 },
+                "year": {
+                    "type": "integer",
+                    "description": (
+                        "Optional. If given, only releases from that year "
+                        "are returned. Use this when the user asks about "
+                        "a specific year ('X's 2003 albums', 'singles in 2001')."
+                    ),
+                },
             },
             "required": ["artist"],
+        },
+    },
+    {
+        "name": "get_tracklist",
+        "description": (
+            "Get the full tracklist of a release (album or single). Use "
+            "when the user asks 'what are the tracks on X', 'what's the "
+            "tracklist of X', or asks for individual track titles on a "
+            "release. Returns each track's position and title in order."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "release_title": {
+                    "type": "string",
+                    "description": (
+                        "Title of the release (album or single) to fetch "
+                        "the tracklist for, e.g. 'Minimoni Songs 2' or "
+                        "'Last Kiss'."
+                    ),
+                },
+            },
+            "required": ["release_title"],
         },
     },
     {

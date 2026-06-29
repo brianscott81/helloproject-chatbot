@@ -146,15 +146,24 @@ def tool_get_song_info(conn, song_title: str) -> dict:
     return _summarize_song_info(info)
 
 
-def tool_list_releases(conn, artist: str, kind: str = "album") -> dict:
-    """List all releases (albums or singles) by an artist."""
+def tool_list_releases(
+    conn,
+    artist: str,
+    kind: str = "album",
+    year: int | None = None,
+) -> dict:
+    """List all releases (albums or singles) by an artist.
+
+    If year is given, only releases from that year are returned.
+    """
     artist_page = find_artist_page(conn, artist)
     if not artist_page:
         return {"error": f"Artist '{artist}' not found"}
-    releases = find_album_for_artist(conn, artist_page, kind=kind)
+    releases = find_album_for_artist(conn, artist_page, kind=kind, year=year)
     return {
         "artist": artist_page.title,
         "kind": kind,
+        "year": year,
         "count": len(releases),
         "releases": [
             {
@@ -164,6 +173,33 @@ def tool_list_releases(conn, artist: str, kind: str = "album") -> dict:
                 "track_count": r.track_count,
             }
             for i, r in enumerate(releases)
+        ],
+    }
+
+
+def tool_get_tracklist(conn, release_title: str) -> dict:
+    """Get the full tracklist of a release (album or single).
+
+    Resolves the title via redirects, then returns all non-karaoke
+    tracks in order. Each track has position, raw (wikitext), and
+    linked_title (the destination of the [[wikilink]] if present).
+    """
+    from query import get_tracklist_for_title, resolve_title_with_aliases
+    page, _ = resolve_title_with_aliases(conn, release_title)
+    tracks = get_tracklist_for_title(conn, release_title)
+    if not page and not tracks:
+        return {"error": f"Release '{release_title}' not found"}
+    return {
+        "title": page.title if page else release_title,
+        "page_id": page.id if page else None,
+        "track_count": len(tracks),
+        "tracks": [
+            {
+                "position": t.position,
+                "raw": t.raw,
+                "linked_title": t.linked_title,
+            }
+            for t in tracks
         ],
     }
 
@@ -446,7 +482,7 @@ def try_llm_tool_fallback(
         return None
     # Validate: the tool name must be one we can actually execute.
     tool = result.get("tool")
-    if tool not in ("lookup_track", "list_releases", "semantic_search"):
+    if tool not in ("lookup_track", "list_releases", "semantic_search", "get_tracklist"):
         return None
     # Normalize args: add 'kind' default for lookup_track, ensure
     # 'query' / 'k' for semantic_search, etc.
@@ -464,6 +500,15 @@ def try_llm_tool_fallback(
     elif tool == "list_releases":
         if "kind" not in args:
             args["kind"] = "album"
+        # Coerce year to int if present
+        if "year" in args and args["year"] is not None:
+            try:
+                args["year"] = int(args["year"])
+            except (TypeError, ValueError):
+                return None
+    elif tool == "get_tracklist":
+        # Only release_title is required; nothing else to normalize
+        pass
     elif tool == "semantic_search":
         if "k" not in args:
             args["k"] = 5
@@ -558,6 +603,9 @@ def execute_tool_call(
     elif tool == "get_song_info":
         with connect(db_path) as conn:
             return tool_get_song_info(conn, **args)
+    elif tool == "get_tracklist":
+        with connect(db_path) as conn:
+            return tool_get_tracklist(conn, **args)
     elif tool == "semantic_search":
         return tool_semantic_search(chroma_dir, db_path=db_path, **args)
     else:
@@ -622,6 +670,10 @@ def synthesize_answer(
     if "artist" in tool_result and "released" in tool_result:
         return _format_song_info(tool_result)
 
+    # Tracklist result
+    if "tracks" in tool_result and "track_count" in tool_result:
+        return _format_get_tracklist(tool_result)
+
     # Semantic search result
     if "chunks" in tool_result:
         return _format_semantic_search(tool_result)
@@ -639,6 +691,8 @@ def _guess_tool_name(tool_result: dict) -> str:
         return "semantic_search"
     if "artist" in tool_result and "released" in tool_result:
         return "get_song_info"
+    if "tracks" in tool_result and "track_count" in tool_result:
+        return "get_tracklist"
     return "unknown"
 
 
@@ -730,6 +784,19 @@ def _format_semantic_search(r: dict) -> str:
             for fact in chunk["infobox_facts"]:
                 lines.append(f"    • {fact}")
         lines.append("")
+    return "\n".join(lines)
+
+
+def _format_get_tracklist(r: dict) -> str:
+    """Format a get_tracklist tool result for display."""
+    if "error" in r:
+        return r["error"]
+    if r.get("track_count", 0) == 0:
+        return f"No tracks found for '{r.get('title')}'."
+    lines = [f"**{r['title']}** — {r['track_count']} tracks:"]
+    for t in r["tracks"]:
+        title = t["linked_title"] or _strip_wikilink(t["raw"])
+        lines.append(f"  {t['position']:2}. {title}")
     return "\n".join(lines)
 
 

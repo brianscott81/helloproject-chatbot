@@ -422,6 +422,54 @@ def classify_question(question: str) -> dict:
     return {"tool": "semantic_search", "args": {"query": q, "k": 5}}
 
 
+def try_llm_tool_fallback(
+    question: str,
+    prior_turns_str: str | None = None,
+) -> dict | None:
+    """If the regex classifier falls through to semantic_search, try
+    asking the LLM to pick a structured tool.
+
+    Returns a routing decision (same shape as classify_question) if
+    the LLM picks a tool successfully. Returns None if the LLM
+    can't be reached, doesn't support tool-use, or doesn't pick a
+    tool we recognize.
+    """
+    try:
+        from llm import select_tool_with_llm
+    except ImportError:
+        return None
+    try:
+        result = select_tool_with_llm(question, prior_turns_str=prior_turns_str)
+    except Exception:
+        return None
+    if not result:
+        return None
+    # Validate: the tool name must be one we can actually execute.
+    tool = result.get("tool")
+    if tool not in ("lookup_track", "list_releases", "semantic_search"):
+        return None
+    # Normalize args: add 'kind' default for lookup_track, ensure
+    # 'query' / 'k' for semantic_search, etc.
+    args = result.get("args", {})
+    if tool == "lookup_track":
+        if "kind" not in args:
+            args["kind"] = "album"
+        # Coerce position args to int (LLM may return strings)
+        for k in ("album_position", "track_position"):
+            if k in args:
+                try:
+                    args[k] = int(args[k])
+                except (TypeError, ValueError):
+                    return None
+    elif tool == "list_releases":
+        if "kind" not in args:
+            args["kind"] = "album"
+    elif tool == "semantic_search":
+        if "k" not in args:
+            args["k"] = 5
+    return {"tool": tool, "args": args}
+
+
 def _pick_ordinal(digit_group: str | None, word_group: str | None) -> int:
     """Pick the integer from an ORDINAL match (digit preferred, else word)."""
     if digit_group:
@@ -707,6 +755,7 @@ def answer_question(
     on_tool_complete: "callable | None" = None,
     prior_year: int | None = None,
     prior_turns_str: str | None = None,
+    use_llm_tool_fallback: bool = True,
 ) -> str:
     """Answer a single question end-to-end.
 
@@ -718,10 +767,15 @@ def answer_question(
     year' will be rewritten to specific years (e.g., 'in 2011') using
     prior_year as the anchor.
 
+    If `use_llm_tool_fallback` is True and the regex classifier falls
+    through to the default semantic_search, we ask the LLM (via the
+    Anthropic tool-use API) to pick a structured tool. The LLM's
+    choice is validated and used. This is Phase 1 of the LLM-tool
+    integration plan.
+
     If `on_tool_complete` is provided, it will be called as
     `on_tool_complete(tool_call, tool_result, answer)` after the tool
     executes but before synthesis. Used by the REPL to record turns
-    into a Conversation without re-running classify/execute.
     """
     notes: list[str] = []
     if context is not None:
@@ -740,6 +794,28 @@ def answer_question(
     call = classify_question(question)
     if verbose:
         print(f"[classify] -> {call}", file=sys.stderr)
+
+    # Phase 1: if the regex classifier fell through to the default
+    # semantic_search, try asking the LLM to pick a structured tool.
+    # The LLM has prior-turn context (when provided) so it can handle
+    # questions the regex can't, like "Minimoni's singles" or
+    # "what year did they disband".
+    if (use_llm_tool_fallback
+            and call.get("tool") == "semantic_search"):
+        # Only try if we have an LLM available. The LLM env vars are
+        # required, so just check for that.
+        import os
+        if os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+            if verbose:
+                print(f"[llm_tool] regex fell through; trying LLM tool-use fallback",
+                      file=sys.stderr)
+            llm_call = try_llm_tool_fallback(question, prior_turns_str=prior_turns_str)
+            if llm_call:
+                if verbose:
+                    print(f"[llm_tool] -> {llm_call}", file=sys.stderr)
+                call = llm_call
+            elif verbose:
+                print(f"[llm_tool] no tool picked; using regex default", file=sys.stderr)
 
     result = execute_tool_call(db_path, chroma_dir, call)
     if verbose:
@@ -773,6 +849,10 @@ def main() -> int:
                    help="Disable the LLM-side conversation context (don't "
                         "send prior turns to the LLM). Useful for privacy "
                         "or to compare answers with/without history.")
+    p.add_argument("--no-tool-llm", action="store_true",
+                   help="Disable the LLM tool-use routing fallback (Phase 1). "
+                        "When set, the regex classifier is the only router, "
+                        "and ambiguous questions always go to semantic_search.")
     args = p.parse_args()
 
     db_path = Path(args.db)
@@ -986,6 +1066,7 @@ def main() -> int:
                     on_tool_complete=record_turn,
                     prior_year=prior_year,
                     prior_turns_str=prior_turns_str,
+                    use_llm_tool_fallback=not args.no_tool_llm,
                 )
                 if conv and conv.turns and conv.turns[-1].role == "assistant":
                     conv.turns[-1].content = answer
@@ -1020,7 +1101,11 @@ def main() -> int:
     if not args.question:
         p.error("--question is required (or use --interactive)")
 
-    print(answer_question(args.question, db_path, chroma_dir, verbose=args.verbose, llm=llm))
+    print(answer_question(
+        args.question, db_path, chroma_dir,
+        verbose=args.verbose, llm=llm,
+        use_llm_tool_fallback=not args.no_tool_llm,
+    ))
     return 0
 
 

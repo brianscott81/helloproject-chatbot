@@ -556,6 +556,183 @@ def call_ollama(
 
 
 # ---------------------------------------------------------------------------
+# Tool-use (function-calling) for routing fallback
+# ---------------------------------------------------------------------------
+
+# JSON schemas for each structured tool. These are passed to the LLM
+# as a `tools=` parameter; the model picks one and supplies args. This
+# replaces our regex-based classifier as a FALLBACK for ambiguous
+# questions that the regex doesn't handle (Phase 1 of the LLM-tool
+# integration plan).
+TOOL_SCHEMAS: list[dict] = [
+    {
+        "name": "lookup_track",
+        "description": (
+            "Look up the Nth track of an artist's Mth album. Use for "
+            "questions like 'what is track 5 of X's 3rd album' or "
+            "'what is the second track of Minimoni's 2nd album'. "
+            "Returns the exact track title plus song infobox data."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "artist": {
+                    "type": "string",
+                    "description": "Artist name as it appears on the wiki, e.g. 'Minimoni', 'Morning Musume', 'C-ute'.",
+                },
+                "album_position": {
+                    "type": "integer",
+                    "description": "Which album in chronological release order (1-indexed). 1st album, 2nd album, etc.",
+                },
+                "track_position": {
+                    "type": "integer",
+                    "description": "Track number on the album (1-indexed).",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["album", "single"],
+                    "description": "Release type. Default 'album'.",
+                },
+            },
+            "required": ["artist", "album_position", "track_position"],
+        },
+    },
+    {
+        "name": "list_releases",
+        "description": (
+            "List all albums or singles by an artist. Use for 'list all "
+            "albums by X', 'what singles did X release', or 'show me X's "
+            "discography'. Returns a chronological list with release dates."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "artist": {
+                    "type": "string",
+                    "description": "Artist name as it appears on the wiki.",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["album", "single"],
+                    "description": "Which type of release to list. Default 'album'.",
+                },
+            },
+            "required": ["artist"],
+        },
+    },
+    {
+        "name": "semantic_search",
+        "description": (
+            "Fuzzy / open-ended search across the wiki. Use when the "
+            "question is about history, biography, general facts, or "
+            "when you don't know which specific page to look at. Returns "
+            "top-matching wiki chunks with their infobox facts."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query. Should be a short keyword phrase or question, not a full sentence.",
+                },
+            },
+            "required": ["query"],
+        },
+    },
+]
+
+
+def select_tool_with_llm(
+    question: str,
+    prior_turns_str: str | None = None,
+) -> dict | None:
+    """Ask the LLM to pick a structured tool for this question.
+
+    Returns a dict like {"tool": "lookup_track", "args": {...}} or
+    {"tool": "semantic_search", "args": {"query": "..."}}, or None if
+    the LLM call fails / provider doesn't support tools / model didn't
+    pick a tool.
+
+    Used as a fallback when the regex classifier in chat.py returns
+    the default semantic_search fallback (i.e. when no structured
+    pattern matched). The model has prior-turn context via the same
+    `prior_turns_str` mechanism as the synthesis path.
+    """
+    # We route through the Anthropic SDK regardless of provider name,
+    # because the MiniMax-compat endpoint accepts the Anthropic SDK's
+    # tool-use API. OpenAI and Ollama don't (their API is different).
+    if not os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        log.warning("select_tool_with_llm: no Anthropic-style credentials")
+        return None
+
+    try:
+        from anthropic import Anthropic
+    except ImportError:
+        log.warning("select_tool_with_llm: anthropic package not installed")
+        return None
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    base_url = os.environ.get("ANTHROPIC_BASE_URL")
+
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        client_kwargs = {"api_key": api_key}
+    else:
+        client_kwargs = {"auth_token": api_key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+
+    client = Anthropic(**client_kwargs)
+
+    # Default to MiniMax-M3 when routing through MiniMax, else Haiku.
+    default_model = "claude-3-5-haiku-latest"
+    if base_url and "minimax" in base_url.lower():
+        default_model = "MiniMax-M3"
+    model = os.environ.get("HELLO_PROJECT_ANTHROPIC_MODEL", default_model)
+
+    # Build system prompt. Tool-use doesn't need the full synthesis
+    # system prompt; just enough to constrain the model to picking a tool.
+    system_prompt = (
+        "You are a routing assistant. Pick the right tool for the "
+        "user's question and supply its arguments. Use prior turns to "
+        "resolve pronouns ('it', 'they') and relative references "
+        "('next year', 'previous album'). Only call a tool — never "
+        "answer in prose."
+    )
+
+    user_msg = question
+    if prior_turns_str:
+        user_msg = f"{prior_turns_str}\n\nCurrent question: {question}"
+
+    try:
+        resp = client.messages.create(
+            model=model,
+            max_tokens=300,
+            system=system_prompt,
+            tools=TOOL_SCHEMAS,
+            tool_choice={"type": "any"},  # force tool use, no plain text
+            messages=[{"role": "user", "content": user_msg}],
+        )
+    except Exception as e:
+        log.warning(f"select_tool_with_llm: API call failed: {e}")
+        return None
+
+    # Find the tool_use block in the response.
+    for block in resp.content:
+        # ToolUseBlock has a .type attr of 'tool_use' and .name / .input
+        if getattr(block, "type", None) == "tool_use":
+            return {
+                "tool": block.name,
+                "args": dict(block.input) if block.input else {},
+            }
+
+    # No tool_use block. Model returned plain text instead of calling
+    # a tool. This shouldn't happen with tool_choice=any, but we handle
+    # gracefully.
+    log.warning("select_tool_with_llm: model did not call a tool")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 

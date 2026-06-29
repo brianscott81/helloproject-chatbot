@@ -15,8 +15,13 @@ anthropic>=0.85.0,<1.0
 # OpenAI SDK (used for real OpenAI and Ollama via OpenAI-compat).
 openai>=1.0.0,<3.0
 
-# ChromaDB (vector storage). 1.x is the current major.
-chromadb>=1.0,<2.0
+# ChromaDB (vector storage). Pin to 1.5.9 exactly because:
+# - The local index was built with chromadb 1.5.9. Different 1.x
+#   versions have different SQLite schemas and Rust API internals.
+#   A version mismatch causes "pool timed out" and
+#   "'RustBindingsAPI' has no attribute 'bindings'" errors.
+# - 1.5.9 is the latest 1.x release as of 2026-05.
+chromadb==1.5.9
 
 # sentence-transformers is needed at runtime by tool_semantic_search
 # in chat.py. It dynamically loads SentenceTransformer to embed the

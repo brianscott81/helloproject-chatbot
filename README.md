@@ -54,6 +54,12 @@ python chat.py -q "What was the second track of Minimoni's second album?"
 # Interactive REPL
 python chat.py -i
 
+# Web interface (browser-based chat UI)
+python web.py                  # serves on http://127.0.0.1:8000
+python web.py --port 9000      # custom port
+python web.py --no-llm         # template formatters only
+python web.py --host 0.0.0.0   # expose on a network (use with caution)
+
 # Run the test suite (9/9 should pass)
 python e2e_test.py
 python e2e_test.py --structured-only   # skip semantic tests
@@ -124,7 +130,10 @@ Answers still contain the right facts, just in a less-polished format.
 - `query.py` — high-level query API (resolve_title, find_album_for_artist, etc.)
 - `build_embeddings.py` — wikitext → ChromaDB with BAAI/bge-small-en-v1.5
 - `chat.py` — CLI + classifier + tool dispatch + template formatters
-- `llm.py` — LLM synthesis layer (4 providers, auto-detect, graceful fallback)
+- `conversation.py` — per-session conversation state (turns, prior-turn context for LLM)
+- `llm.py` — LLM synthesis layer (4 providers, auto-detect, graceful fallback) + tool-use routing
+- `web.py` — stdlib HTTP server wrapping chat for the browser
+- `web/index.html`, `web/chat.js`, `web/chat.css` — chat UI (Markdown via marked.js CDN)
 - `demo.py` — quick interactive sanity checks
 - `e2e_test.py` — 9-question test battery
 

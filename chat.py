@@ -204,26 +204,15 @@ def tool_get_tracklist(conn, release_title: str) -> dict:
     }
 
 
-# Module-level cache for the embedding model and chroma client.
-# Avoids reloading SentenceTransformer (~400MB in RAM) on every
-# semantic search request, which would be very slow.
+# Module-level cache for the embedding model only. We deliberately
+# do NOT cache the chromadb PersistentClient because:
+#   1. The Rust client has shown transient errors in 1.5.9
+#      (e.g. 'RustBindingsAPI' has no attribute 'bindings') that
+#      leave the client in a broken state until restart.
+#   2. A pool timeout on the first call can poison subsequent calls.
+# A fresh client per request is slower (~200-500ms) but bulletproof.
+# For a single-user deploy, this is the right trade-off.
 _EMBEDDING_MODEL = None
-_CHROMA_CLIENT = None
-_CHROMA_COLLECTION = None
-
-
-def _get_chroma_collection(chroma_dir: Path):
-    """Return the chroma collection, opening the client on first call.
-
-    Caches the client and collection so subsequent calls don't pay
-    the I/O cost of re-opening the persistent store.
-    """
-    global _CHROMA_CLIENT, _CHROMA_COLLECTION
-    if _CHROMA_COLLECTION is None:
-        import chromadb
-        _CHROMA_CLIENT = chromadb.PersistentClient(path=str(chroma_dir))
-        _CHROMA_COLLECTION = _CHROMA_CLIENT.get_collection("helloproject")
-    return _CHROMA_COLLECTION
 
 
 def _get_embedding_model():
@@ -233,6 +222,39 @@ def _get_embedding_model():
         from sentence_transformers import SentenceTransformer
         _EMBEDDING_MODEL = SentenceTransformer("BAAI/bge-small-en-v1.5")
     return _EMBEDDING_MODEL
+
+
+def _semantic_search_with_retry(chroma_dir: Path, q_emb: list, k: int) -> dict | None:
+    """Run a chromadb query, retrying once on transient failures.
+
+    The chromadb Rust client sometimes returns the
+    'RustBindingsAPI' has no attribute 'bindings' error or 'pool
+    timed out' error, especially after OOM or under low memory.
+    A second try with a fresh client usually succeeds.
+
+    Returns the chromadb result dict on success, or None on
+    failure after the retry.
+    """
+    import chromadb
+    last_err = None
+    for attempt in range(2):
+        try:
+            client = chromadb.PersistentClient(path=str(chroma_dir))
+            collection = client.get_collection("helloproject")
+            res = collection.query(
+                query_embeddings=q_emb,
+                n_results=min(k * 3, 25),
+            )
+            return res
+        except Exception as e:
+            last_err = e
+            # Force garbage collection of the failed client so the
+            # next attempt gets a truly fresh state.
+            import gc
+            gc.collect()
+    if last_err is not None:
+        raise last_err
+    return None
 
 
 def tool_semantic_search(
@@ -250,17 +272,14 @@ def tool_semantic_search(
     clean. Augmenting with infobox data gives the LLM everything it
     needs without re-embedding.
 
-    The embedding model and chroma client are cached at module level
-    so the first request after startup pays the load cost, and
-    subsequent requests are fast.
+    The embedding model is cached at module level so we don't
+    re-load the ~400MB SentenceTransformer on every request.
+    The chromadb client is opened fresh on each call to avoid
+    transient errors from the Rust client polluting subsequent
+    calls.
     """
     if not chroma_dir.exists():
         return {"error": "Vector index not built. Run build_embeddings.py first."}
-
-    try:
-        collection = _get_chroma_collection(chroma_dir)
-    except Exception as e:
-        return {"error": f"Failed to open vector index: {e}"}
 
     # Embed the query using the cached model.
     try:
@@ -269,12 +288,13 @@ def tool_semantic_search(
     except Exception as e:
         return {"error": f"Failed to embed query: {e}"}
 
-    # Fetch extra results so we can deduplicate by page and surface more
-    # diverse pages.
-    res = collection.query(
-        query_embeddings=q_emb,
-        n_results=min(k * 3, 25),
-    )
+    # Run the chromadb query with retry. Each retry opens a fresh
+    # client. This works around the 'RustBindingsAPI' / pool-timeout
+    # errors that we've seen on Fly.io's 1GB free tier.
+    try:
+        res = _semantic_search_with_retry(chroma_dir, q_emb, k)
+    except Exception as e:
+        return {"error": f"Failed to open vector index: {e}"}
 
     # Deduplicate: prefer highest-scoring chunk per page_id, but keep
     # at most one chunk per page so we don't flood with one-page hits.

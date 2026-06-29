@@ -522,6 +522,7 @@ def synthesize_answer(
     tool_name: str | None = None,
     llm: "LLMSynthesizer | None" = None,
     verbose: bool = False,
+    prior_turns_str: str | None = None,
 ) -> str:
     """Format a tool result into a human-readable answer.
 
@@ -529,6 +530,12 @@ def synthesize_answer(
     v2: when an LLM is available, pass the tool result + question to it
         and let it write natural-language prose. Falls back to the
         template formatters if no LLM is configured or the call fails.
+
+    prior_turns_str: optional pre-formatted block of recent
+        conversation history (from
+        conversation.format_prior_turns_for_llm()). When provided
+        and an LLM is in use, this is forwarded to the LLM so it can
+        produce context-aware answers that reference prior turns.
 
     This is the integration point — the LLM layer is opt-in. To enable,
     pass an LLMSynthesizer instance or set ANTHROPIC_API_KEY / OPENAI_API_KEY
@@ -539,7 +546,10 @@ def synthesize_answer(
         # Determine the tool name from the result shape if not provided.
         if tool_name is None:
             tool_name = _guess_tool_name(tool_result)
-        llm_answer = llm.synthesize(question, tool_name, tool_result)
+        llm_answer = llm.synthesize(
+            question, tool_name, tool_result,
+            prior_turns_str=prior_turns_str,
+        )
         if llm_answer:
             if verbose:
                 print(f"[llm] {llm.describe()}", file=sys.stderr)
@@ -696,6 +706,7 @@ def answer_question(
     context: "Context | None" = None,
     on_tool_complete: "callable | None" = None,
     prior_year: int | None = None,
+    prior_turns_str: str | None = None,
 ) -> str:
     """Answer a single question end-to-end.
 
@@ -741,7 +752,12 @@ def answer_question(
             if verbose:
                 print(f"[callback] failed: {e}", file=sys.stderr)
 
-    return synthesize_answer(question, result, tool_name=call.get("tool"), llm=llm, verbose=verbose)
+    return synthesize_answer(
+        question, result,
+        tool_name=call.get("tool"),
+        llm=llm, verbose=verbose,
+        prior_turns_str=prior_turns_str,
+    )
 
 
 def main() -> int:
@@ -753,6 +769,10 @@ def main() -> int:
     p.add_argument("--verbose", "-v", action="store_true")
     p.add_argument("--no-llm", action="store_true",
                    help="Disable the LLM synthesis layer (use template formatters)")
+    p.add_argument("--no-context", action="store_true",
+                   help="Disable the LLM-side conversation context (don't "
+                        "send prior turns to the LLM). Useful for privacy "
+                        "or to compare answers with/without history.")
     args = p.parse_args()
 
     db_path = Path(args.db)
@@ -870,6 +890,23 @@ def main() -> int:
                 if args.verbose and decision.note:
                     print(f"[followup] {decision.note}", file=sys.stderr)
 
+                # Compute the LLM-side context block from prior turns.
+                # Used for both the continuation branch and the
+                # new-question branch. Skipped if --no-context or if
+                # no LLM is configured.
+                prior_turns_str = None
+                if (conv is not None and len(conv.turns) >= 2
+                        and llm is not None and llm.available
+                        and not args.no_context):
+                    try:
+                        from conversation import format_prior_turns_for_llm
+                        prior_turns_str = format_prior_turns_for_llm(conv.turns[:-1])
+                    except Exception as e:
+                        if args.verbose:
+                            print(f"[context] prior-turn format failed: {e}",
+                                  file=sys.stderr)
+                        prior_turns_str = None
+
                 if decision.kind == "continuation":
                     # Re-issue the prior tool call. If the prior tool was
                     # lookup_track and we now know a song title, switch
@@ -895,6 +932,7 @@ def main() -> int:
                         question, result,
                         tool_name=call.get("tool"),
                         llm=llm, verbose=args.verbose,
+                        prior_turns_str=prior_turns_str,
                     )
 
                     if conv:
@@ -947,6 +985,7 @@ def main() -> int:
                     verbose=args.verbose, llm=llm, context=ctx,
                     on_tool_complete=record_turn,
                     prior_year=prior_year,
+                    prior_turns_str=prior_turns_str,
                 )
                 if conv and conv.turns and conv.turns[-1].role == "assistant":
                     conv.turns[-1].content = answer

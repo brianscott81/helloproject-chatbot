@@ -276,6 +276,77 @@ class Conversation:
 
 
 # ---------------------------------------------------------------------------
+# Prior-turn formatting for LLM context
+# ---------------------------------------------------------------------------
+
+# Maximum assistant content to include in the prior-turn block. Long
+# answers add noise without helping synthesis — a short preview is
+# enough for the model to know what it just said.
+_MAX_ASSISTANT_PREVIEW = 200
+# Maximum prior user turns to include (assistant turns interleaved
+# roughly 1:1, so 4 user turns ~ 4-8 total entries).
+MAX_PRIOR_USER_TURNS = 4
+
+
+def format_prior_turns_for_llm(
+    turns: list,
+    max_user_turns: int = MAX_PRIOR_USER_TURNS,
+) -> str:
+    """Format prior conversation turns as a block suitable for LLM context.
+
+    Returns a string like:
+
+        [User]: Tell me about Minimoni.
+        [Assistant]: Minimoni was a Hello! Project subgroup of Morning
+            Musume active from 2000-2004...
+        [User]: When did they disband?
+
+    Returns an empty string if there are no prior user turns (the LLM
+    doesn't need to see the current turn in its own context — the
+    user_question field already provides it).
+
+    Note: 'turns' is expected to be a list of Turn objects (or anything
+    with .role and .content attributes).
+    """
+    if not turns:
+        return ""
+
+    # Only consider turns strictly before the current one. The caller
+    # should pass `conv.turns[:-1]` to get prior turns.
+    # Within those, keep only the last N user turns.
+    prior_user_indices: list[int] = []
+    for i, t in enumerate(turns):
+        if t.role == "user":
+            prior_user_indices.append(i)
+
+    # Keep the most recent N. For each, also keep the assistant turn
+    # that follows it (the natural pair).
+    keep_indices: set[int] = set()
+    for i in prior_user_indices[-max_user_turns:]:
+        keep_indices.add(i)
+        if i + 1 < len(turns) and turns[i + 1].role == "assistant":
+            keep_indices.add(i + 1)
+
+    if not keep_indices:
+        return ""
+
+    lines = []
+    for i in sorted(keep_indices):
+        t = turns[i]
+        role_label = "User" if t.role == "user" else "Assistant"
+        content = (t.content or "").strip()
+        if not content:
+            continue
+        if t.role == "assistant" and len(content) > _MAX_ASSISTANT_PREVIEW:
+            content = content[:_MAX_ASSISTANT_PREVIEW].rstrip() + "..."
+        # Indent multi-line content for readability.
+        content = content.replace("\n", "\n    ")
+        lines.append(f"[{role_label}]: {content}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Pronoun substitution
 # ---------------------------------------------------------------------------
 

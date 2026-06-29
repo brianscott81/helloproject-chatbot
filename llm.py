@@ -166,6 +166,35 @@ chronological order). Mention the ambiguity briefly if both are relevant.
 """
 
 
+# Block appended to the system prompt when prior conversation turns
+# are available. Tells the model how to use the history without
+# hallucinating references.
+PRIOR_TURNS_PROMPT_BLOCK = """\
+
+CONTINUING A CONVERSATION:
+- The PRIOR TURNS section below shows recent exchanges with the user.
+- You may reference them when the user uses pronouns ("it", "they")
+  or follow-up phrases ("how about...", "what about...") that depend
+  on context you already established.
+- ONLY reference turns that are explicitly shown. Do not invent prior
+  exchanges ("as you mentioned earlier..." when nothing was mentioned).
+- If the prior context is irrelevant to the current question, ignore it.
+"""
+
+
+def build_system_prompt(prior_turns_str: str | None = None) -> str:
+    """Return the system prompt, optionally extended with prior-turn
+    instructions and content.
+
+    prior_turns_str: a block already formatted by
+        conversation.format_prior_turns_for_llm(). If None or empty,
+        the system prompt is returned unchanged.
+    """
+    if not prior_turns_str:
+        return SYSTEM_PROMPT
+    return SYSTEM_PROMPT + PRIOR_TURNS_PROMPT_BLOCK + "\n\nPRIOR TURNS:\n" + prior_turns_str
+
+
 # ---------------------------------------------------------------------------
 # Tool-result serialization for the LLM
 # ---------------------------------------------------------------------------
@@ -307,12 +336,13 @@ def _serialize_semantic(r: dict) -> str:
         lines.append("")
     return "\n".join(lines)
 
-
-# ---------------------------------------------------------------------------
-# Provider implementations
-# ---------------------------------------------------------------------------
-
-def call_anthropic(question: str, tool_name: str, tool_result: dict, model: str | None = None) -> str | None:
+def call_anthropic(
+    question: str,
+    tool_name: str,
+    tool_result: dict,
+    model: str | None = None,
+    prior_turns_str: str | None = None,
+) -> str | None:
     """Call Anthropic's API (or any Anthropic-compatible endpoint).
 
     The Anthropic SDK supports two auth styles — `api_key` (sk-ant-...)
@@ -325,6 +355,10 @@ def call_anthropic(question: str, tool_name: str, tool_result: dict, model: str 
       ANTHROPIC_AUTH_TOKEN           (Claude Code / MiniMax-style auth)
       ANTHROPIC_BASE_URL             (override endpoint)
       HELLO_PROJECT_ANTHROPIC_MODEL  (default: claude-3-5-haiku-latest)
+
+    prior_turns_str: optional block of recent conversation history
+        formatted by conversation.format_prior_turns_for_llm(). When
+        provided, the system prompt is extended with it.
     """
     try:
         from anthropic import Anthropic
@@ -368,7 +402,7 @@ def call_anthropic(question: str, tool_name: str, tool_result: dict, model: str 
         msg = client.messages.create(
             model=model,
             max_tokens=600,
-            system=SYSTEM_PROMPT,
+            system=build_system_prompt(prior_turns_str),
             messages=[{"role": "user", "content": user_msg}],
         )
         return "".join(b.text for b in msg.content if hasattr(b, "text")).strip()
@@ -377,8 +411,19 @@ def call_anthropic(question: str, tool_name: str, tool_result: dict, model: str 
         return None
 
 
-def call_openai(question: str, tool_name: str, tool_result: dict, model: str | None = None) -> str | None:
-    """Call OpenAI's API. Returns None on failure (caller falls back)."""
+def call_openai(
+    question: str,
+    tool_name: str,
+    tool_result: dict,
+    model: str | None = None,
+    prior_turns_str: str | None = None,
+) -> str | None:
+    """Call OpenAI's API. Returns None on failure (caller falls back).
+
+    prior_turns_str: optional block of recent conversation history
+        formatted by conversation.format_prior_turns_for_llm(). When
+        provided, the system prompt is extended with it.
+    """
     try:
         from openai import OpenAI
     except ImportError:
@@ -395,7 +440,7 @@ def call_openai(question: str, tool_name: str, tool_result: dict, model: str | N
             model=model,
             max_tokens=600,
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": build_system_prompt(prior_turns_str)},
                 {"role": "user", "content": user_msg},
             ],
         )
@@ -405,7 +450,13 @@ def call_openai(question: str, tool_name: str, tool_result: dict, model: str | N
         return None
 
 
-def call_minimax(question: str, tool_name: str, tool_result: dict, model: str | None = None) -> str | None:
+def call_minimax(
+    question: str,
+    tool_name: str,
+    tool_result: dict,
+    model: str | None = None,
+    prior_turns_str: str | None = None,
+) -> str | None:
     """Call MiniMax's Anthropic-compatible API. Returns None on failure.
 
     MiniMax exposes an Anthropic-compatible chat completions endpoint
@@ -454,7 +505,7 @@ def call_minimax(question: str, tool_name: str, tool_result: dict, model: str | 
         msg = client.messages.create(
             model=model,
             max_tokens=600,
-            system=SYSTEM_PROMPT,
+            system=build_system_prompt(prior_turns_str),
             messages=[{"role": "user", "content": user_msg}],
         )
         return "".join(b.text for b in msg.content if hasattr(b, "text")).strip()
@@ -463,8 +514,19 @@ def call_minimax(question: str, tool_name: str, tool_result: dict, model: str | 
         return None
 
 
-def call_ollama(question: str, tool_name: str, tool_result: dict, model: str | None = None) -> str | None:
-    """Call a local Ollama server. Returns None on failure (caller falls back)."""
+def call_ollama(
+    question: str,
+    tool_name: str,
+    tool_result: dict,
+    model: str | None = None,
+    prior_turns_str: str | None = None,
+) -> str | None:
+    """Call a local Ollama server. Returns None on failure (caller falls back).
+
+    prior_turns_str: optional block of recent conversation history
+        formatted by conversation.format_prior_turns_for_llm(). When
+        provided, the system prompt is extended with it.
+    """
     import urllib.request
     import urllib.error
 
@@ -474,7 +536,7 @@ def call_ollama(question: str, tool_name: str, tool_result: dict, model: str | N
 
     payload = json.dumps({
         "model": model,
-        "prompt": f"{SYSTEM_PROMPT}\n\n---\n\nQuestion: {question}\n\n{serialized}\n\nAnswer:",
+        "prompt": f"{build_system_prompt(prior_turns_str)}\n\n---\n\nQuestion: {question}\n\n{serialized}\n\nAnswer:",
         "stream": False,
         "options": {"temperature": 0.2, "num_predict": 600},
     }).encode("utf-8")
@@ -520,20 +582,39 @@ class LLMSynthesizer:
         tool_result: dict,
         *,
         max_retries: int = 1,
+        prior_turns_str: str | None = None,
     ) -> str | None:
-        """Run the LLM. Returns the synthesized answer, or None on failure."""
+        """Run the LLM. Returns the synthesized answer, or None on failure.
+
+        prior_turns_str: optional pre-formatted block of recent
+            conversation turns (use conversation.format_prior_turns_for_llm()
+            to build it). When provided, the system prompt is extended
+            with it so the LLM can produce context-aware answers.
+        """
         if not self.available:
             return None
 
         for attempt in range(max_retries + 1):
             if self.provider == "anthropic":
-                result = call_anthropic(question, tool_name, tool_result)
+                result = call_anthropic(
+                    question, tool_name, tool_result,
+                    prior_turns_str=prior_turns_str,
+                )
             elif self.provider == "openai":
-                result = call_openai(question, tool_name, tool_result)
+                result = call_openai(
+                    question, tool_name, tool_result,
+                    prior_turns_str=prior_turns_str,
+                )
             elif self.provider == "minimax":
-                result = call_minimax(question, tool_name, tool_result)
+                result = call_minimax(
+                    question, tool_name, tool_result,
+                    prior_turns_str=prior_turns_str,
+                )
             elif self.provider == "ollama":
-                result = call_ollama(question, tool_name, tool_result)
+                result = call_ollama(
+                    question, tool_name, tool_result,
+                    prior_turns_str=prior_turns_str,
+                )
             else:
                 return None
 

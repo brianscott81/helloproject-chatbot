@@ -774,11 +774,21 @@ def main() -> int:
         print("Slash commands: /new, /history, /last, /help")
         print()
         try:
-            from conversation import Conversation, parse_input
+            from conversation import Conversation, parse_input, prepare_followup
             conv = Conversation()
         except Exception as e:
             print(f"[conv] init failed: {e}; running single-turn mode", file=sys.stderr)
             conv = None
+
+        # State carried between iterations: the most recent tool call,
+        # so a continuation like "yes" can re-issue it.
+        last_tool_name: str | None = None
+        last_tool_args: dict | None = None
+        last_tool_result: dict | None = None
+
+        # Tool functions we may invoke directly (avoid name-lookup inside
+        # the hot loop and dodge "from chat import ..." import-time guards).
+        from chat import tool_get_song_info, execute_tool_call, synthesize_answer
 
         try:
             while True:
@@ -798,6 +808,9 @@ def main() -> int:
                     elif cmd == "new":
                         if conv:
                             conv.reset()
+                        last_tool_name = None
+                        last_tool_args = None
+                        last_tool_result = None
                         print("(conversation reset)")
                     elif cmd == "history":
                         if not conv:
@@ -824,20 +837,75 @@ def main() -> int:
                         print("  /exit     Quit the REPL (Ctrl-D also works)")
                         print()
                         print("Anything else is treated as a question.")
+                        print("Special follow-ups: 'yes' (more on the last topic),")
+                        print("  'tracklist' / 'members' / 'history' (ask about the last entity).")
                     else:
                         print(f"Unknown command: /{cmd}. Try /help.")
                     continue
 
-                # It's a question.
+                # It's a question (or follow-up).
                 question = parsed.raw
                 if conv:
                     conv.add_user_turn(question)
 
                 ctx = conv.context if conv else None
 
-                # Build the turn-recorder callback. This runs once, after
-                # the tool executes, so the conversation memory gets the
-                # result without us re-running classify/execute.
+                # Decide whether this is a fresh question, a bare-noun
+                # expansion, or a continuation of the prior tool call.
+                decision = prepare_followup(
+                    question, ctx,
+                    last_tool_name=last_tool_name,
+                    last_tool_args=last_tool_args,
+                    last_tool_result=last_tool_result,
+                    verbose=args.verbose,
+                )
+
+                if args.verbose and decision.note:
+                    print(f"[followup] {decision.note}", file=sys.stderr)
+
+                if decision.kind == "continuation":
+                    # Re-issue the prior tool call. If the prior tool was
+                    # lookup_track and we now know a song title, switch
+                    # to get_song_info for a richer answer.
+                    if last_tool_name == "lookup_track" and ctx and ctx.song_title:
+                        # Get full song info instead of just the track listing.
+                        from query import connect
+                        with connect(db_path) as _c:
+                            result = tool_get_song_info(_c, song_title=ctx.song_title)
+                        call = {"tool": "get_song_info", "args": {"song_title": ctx.song_title}}
+                        if args.verbose:
+                            print(f"[continuation] -> get_song_info({ctx.song_title})",
+                                  file=sys.stderr)
+                    else:
+                        # Re-issue the same tool call verbatim.
+                        call = {"tool": last_tool_name, "args": last_tool_args or {}}
+                        result = execute_tool_call(db_path, chroma_dir, call)
+                        if args.verbose:
+                            print(f"[continuation] -> re-call {last_tool_name}",
+                                  file=sys.stderr)
+
+                    answer = synthesize_answer(
+                        question, result,
+                        tool_name=call.get("tool"),
+                        llm=llm, verbose=args.verbose,
+                    )
+
+                    if conv:
+                        conv.add_assistant_turn(
+                            answer, tool_name=call.get("tool"), tool_result=result,
+                        )
+                    last_tool_name = call.get("tool")
+                    last_tool_args = call.get("args")
+                    last_tool_result = result
+                    print(answer)
+                    continue
+
+                # new_question or expansion: run the full pipeline.
+                question_to_classify = (
+                    decision.rewritten_question if decision.kind == "expansion"
+                    else question
+                )
+
                 def record_turn(call, result):
                     if not conv:
                         return
@@ -848,14 +916,35 @@ def main() -> int:
                     )
 
                 answer = answer_question(
-                    question, db_path, chroma_dir,
+                    question_to_classify, db_path, chroma_dir,
                     verbose=args.verbose, llm=llm, context=ctx,
                     on_tool_complete=record_turn,
                 )
-                # Update the just-recorded turn with the actual answer text
-                # (we didn't have it when record_turn fired).
                 if conv and conv.turns and conv.turns[-1].role == "assistant":
                     conv.turns[-1].content = answer
+
+                # Stash the most recent tool call for the next iteration.
+                # We need both the args (to re-issue) and the result (to
+                # detect what kind of tool was called). tool_result on
+                # the Turn holds the dispatch dict in our convention; the
+                # tool_name we can read directly.
+                if conv and conv.turns and conv.turns[-1].tool_name:
+                    last_tool_name = conv.turns[-1].tool_name
+                    last_tool_result = conv.turns[-1].tool_result
+                    # For re-issuing lookup_track we need (artist, album,
+                    # track, kind). For others we don't re-issue; only
+                    # lookup_track triggers the get_song_info upgrade.
+                    if last_tool_name == "lookup_track" and conv.turns[-1].tool_result:
+                        # The result has album/artist — we can rebuild args.
+                        r = conv.turns[-1].tool_result
+                        last_tool_args = {
+                            "artist": r.get("artist", {}).get("title"),
+                            "album_position": r.get("album", {}).get("album_number"),
+                            "track_position": r.get("track", {}).get("position"),
+                        }
+                    else:
+                        last_tool_args = None
+
                 print(answer)
         except (EOFError, KeyboardInterrupt):
             print()

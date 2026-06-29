@@ -400,8 +400,209 @@ def parse_input(raw: str) -> ParsedInput:
 
 
 # ---------------------------------------------------------------------------
+# Follow-up classification (yes/no, bare nouns, temporal references)
+# ---------------------------------------------------------------------------
+
+# Phrases that signal "I want more of what you just gave me". These are
+# continuations, not new questions. When we detect one, we re-issue the
+# same tool call against the same target — which usually means running
+# get_song_info() against the last-mentioned song/album, since that's
+# the densest data source.
+CONTINUATION_PHRASES = {
+    "yes", "yeah", "yep", "yup", "sure", "ok", "okay", "please",
+    "more", "more info", "tell me more", "go on", "continue",
+    "and?", "and then?", "what else?", "details", "more details",
+    "expand", "elaborate",
+}
+
+# Bare nouns that mean "give me the X of the last-mentioned thing".
+# When followed up with one of these, we synthesize a complete question
+# like "What is the tracklist of <last album>?" so the structured
+# classifier has something to match.
+#
+# Some nouns are noun-specific (tracklist applies to an album, members
+# applies to an artist or unit). The entity-priority tuple picks which
+# context field to fill in:
+#   - "tracklist" / "songs" prefer album (tracklists live on albums)
+#   - "members" prefers artist
+#   - "history" / "discography" / "info" prefer artist (most wiki pages
+#     are scoped to a unit/group)
+#   - "singles" / "albums" prefer artist
+#   - default: song > album > artist
+BARE_NOUN_QUERIES = {
+    "tracklist":  ("album", "What is the tracklist of {entity}?"),
+    "songs":      ("album", "What songs are on {entity}?"),
+    "members":    ("artist", "Who are the members of {entity}?"),
+    "history":    ("artist", "What is the history of {entity}?"),
+    "discography":("artist", "What is the discography of {entity}?"),
+    "singles":    ("artist", "What singles has {entity} released?"),
+    "albums":     ("artist", "What albums has {entity} released?"),
+    "info":       ("artist", "Give me info about {entity}."),
+    "details":    ("artist", "Give me details about {entity}."),
+    "facts":      ("artist", "What are some facts about {entity}?"),
+}
+
+# Temporal/ordinal references that should be resolved against context.
+# These get rewritten to concrete phrases before classification.
+TEMPORAL_PATTERNS = [
+    # "the next year" / "the following year" -> "the year after"
+    (r"\bthe\s+next\s+year\b", "the year after"),
+    (r"\bthe\s+following\s+year\b", "the year after"),
+    (r"\bthe\s+previous\s+year\b", "the year before"),
+    (r"\bthe\s+year\s+before\b", "the year before"),
+    # "the next album" / "the previous single"
+    (r"\bthe\s+next\s+(album|single|release)\b", "the {1} after {last_album}"),
+    (r"\bthe\s+previous\s+(album|single|release)\b", "the {1} before {last_album}"),
+]
+
+
+@dataclass
+class FollowupDecision:
+    """The result of classifying a follow-up turn.
+
+    kind:
+      "new_question"   - process as a fresh question (existing behavior)
+      "continuation"   - re-call the last tool, possibly with different args
+      "expansion"      - synthesize a question from a bare-noun follow-up
+    rewritten_question: what to pass to the classifier (for kind=new_question)
+                        or the synthesized full question (for kind=expansion)
+    note: human-readable description of what we decided
+    """
+    kind: str
+    rewritten_question: str = ""
+    note: str = ""
+
+
+def is_continuation(question: str) -> bool:
+    """True if the input is a short acknowledgment / 'more please' phrase."""
+    q = question.strip().lower().rstrip(".?!")
+    if q in CONTINUATION_PHRASES:
+        return True
+    # Also match very short inputs that are obviously yes/no style.
+    if len(q.split()) <= 2 and q in {"yes please", "yes pls", "go ahead", "do it"}:
+        return True
+    return False
+
+
+def is_bare_noun(question: str) -> bool:
+    """True if the input is a single noun that's in BARE_NOUN_QUERIES."""
+    q = question.strip().lower().rstrip(".?!")
+    return q in BARE_NOUN_QUERIES
+
+
+def expand_bare_noun(
+    question: str, ctx: Context,
+) -> tuple[str, str | None]:
+    """If the question is a bare noun, expand it to a full question
+    using the last-remembered entity. Returns (expanded_question, note).
+    """
+    q = question.strip().lower().rstrip(".?!")
+    entry = BARE_NOUN_QUERIES.get(q)
+    if not entry:
+        return question, None
+    preferred_kind, template = entry
+
+    # Pick the entity to fill in. Use the kind-specific field first,
+    # then fall back to other context fields.
+    if preferred_kind == "album":
+        entity = ctx.album_title or ctx.artist_title or ctx.song_title or ctx.last_singular_title
+    elif preferred_kind == "artist":
+        entity = ctx.artist_title or ctx.album_title or ctx.song_title or ctx.last_singular_title
+    else:  # song or fallback
+        entity = ctx.song_title or ctx.album_title or ctx.artist_title or ctx.last_singular_title
+
+    if not entity:
+        return question, None
+
+    return template.format(entity=entity), f"(expanded '{question}' to ask about {entity})"
+
+
+def resolve_temporal(question: str, ctx: Context) -> tuple[str, str | None]:
+    """Resolve 'next year', 'previous album', etc. into concrete phrases.
+
+    Note: 'next year' after asking about 2003 means '2004'. We don't
+    know the exact year without LLM help, so we rephrase to a phrase
+    the data layer (or LLM) can use: 'the year after'. The downstream
+    answerer figures out the specific value.
+    """
+    notes: list[str] = []
+    q = question
+
+    for pattern, replacement in TEMPORAL_PATTERNS:
+        m = re.search(pattern, q, re.IGNORECASE)
+        if not m:
+            continue
+
+        new_replacement = replacement
+        if "{1}" in new_replacement and m.group(1):
+            new_replacement = new_replacement.replace("{1}", m.group(1))
+        if "{last_album}" in new_replacement:
+            if ctx.album_title:
+                new_replacement = new_replacement.replace("{last_album}", ctx.album_title)
+                notes.append(f"(bound 'previous/next album' to '{ctx.album_title}')")
+            else:
+                new_replacement = new_replacement.replace("{last_album}", "the previous release")
+
+        q = re.sub(pattern, new_replacement, q, flags=re.IGNORECASE)
+
+    if q != question:
+        return q, (" ".join(notes) if notes else None)
+    return question, None
+
+
+# ---------------------------------------------------------------------------
 # High-level: prepare a question for the classifier
 # ---------------------------------------------------------------------------
+
+def prepare_followup(
+    question: str,
+    ctx: Context,
+    last_tool_name: str | None = None,
+    last_tool_args: dict | None = None,
+    last_tool_result: dict | None = None,
+    verbose: bool = False,
+) -> FollowupDecision:
+    """Decide what kind of follow-up turn this is.
+
+    Returns a FollowupDecision. The REPL acts on this:
+      - "continuation": re-call last tool (with same args or slightly
+                        expanded ones if we have more info now)
+      - "expansion":    the rewritten_question is a full question
+                        suitable for the classifier
+      - "new_question": pass through to the existing prepare_question()
+
+    Parameters
+    ----------
+    last_tool_name, last_tool_args, last_tool_result:
+        The tool call from the previous assistant turn, if any. Used to
+        decide how to handle continuations.
+    """
+    q = question.strip()
+    if not q:
+        return FollowupDecision("new_question", "", "(empty input)")
+
+    # 1. Short acknowledgment -> continuation
+    if is_continuation(q):
+        if last_tool_name:
+            return FollowupDecision(
+                kind="continuation",
+                note=f"(continuation of last tool: {last_tool_name})",
+            )
+        # No prior tool? Fall through to question mode.
+        return FollowupDecision("new_question", q, "")
+
+    # 2. Bare noun -> expansion
+    if is_bare_noun(q):
+        expanded, note = expand_bare_noun(q, ctx)
+        if expanded != q and note:
+            return FollowupDecision(
+                kind="expansion",
+                rewritten_question=expanded,
+                note=note,
+            )
+
+    return FollowupDecision("new_question", q, "")
+
 
 def prepare_question(
     question: str,
@@ -416,6 +617,11 @@ def prepare_question(
     """
     notes: list[str] = []
     q = question
+
+    # Step 0: temporal/ordinal resolution (e.g. "next year" -> "the year after")
+    q, note = resolve_temporal(q, ctx)
+    if note:
+        notes.append(note)
 
     # Step 1: pronoun substitution (e.g. "it" -> "CRAZY ABOUT YOU")
     q, note = substitute_pronouns(q, ctx)

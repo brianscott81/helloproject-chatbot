@@ -2,15 +2,20 @@
 Web interface for the Hello! Project Wiki chatbot.
 
 A small stdlib HTTP server that wraps the chatbot in a browser-friendly
-UI. Per-session conversation state is held in memory and keyed by a
-random session ID stored in a cookie.
+UI. The server is stateless: each /api/chat request carries its own
+prior-turn context, and the server holds no per-user state. This
+solves the per-user-isolation problem and avoids the memory leaks
+of an in-process session dict.
 
 Endpoints:
   GET  /             -> serves web/index.html
   GET  /static/*     -> serves CSS / JS / etc. from web/
-  POST /api/chat     -> JSON {question: "..."}  -> JSON {answer: "..."}
-  POST /api/reset    -> clears the session conversation
+  POST /api/chat     -> JSON {question: "...", prior_turns: [...]}
+                       -> JSON {answer: "..."}
   GET  /api/help     -> list of available slash commands
+
+prior_turns format: [{"role": "user"|"assistant", "content": "..."}, ...]
+The server formats these into the LLM's prior-turn context block.
 
 Run with:
     python web.py                       # defaults: 127.0.0.1:8000
@@ -23,13 +28,8 @@ expose on a network (do this only with auth in place).
 from __future__ import annotations
 
 import argparse
-import http.cookies
 import json
-import os
-import re
-import secrets
 import sys
-import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -40,69 +40,28 @@ HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
 
 import chat
-from conversation import Conversation, format_prior_turns_for_llm
+from conversation import format_prior_turns_for_llm
 
 # Static file directory (next to this file)
 WEB_DIR = HERE / "web"
 
-# Per-session state. Keyed by session_id (random hex string).
-# Each value is a dict {conversation: Conversation, llm: LLMSynthesizer}.
-# Guarded by a lock because BaseHTTPRequestHandler is multi-threaded.
-_sessions: dict[str, dict[str, Any]] = {}
-_sessions_lock = threading.Lock()
+# The server is stateless — no per-session storage, no cookies, no
+# locks. All conversation context travels with each /api/chat request.
 
 
-def _create_session() -> str:
-    """Create a new session and return its ID."""
-    sid = secrets.token_urlsafe(24)
-    with _sessions_lock:
-        _sessions[sid] = {
-            "conversation": Conversation(),
-        }
-    return sid
+class _PriorTurn:
+    """Adapter that gives the prior-turn list a .role / .content
+    attribute interface, matching the Conversation.Turn class.
 
-
-def _get_session(sid: str) -> dict[str, Any] | None:
-    """Look up a session by ID. Returns None if unknown."""
-    with _sessions_lock:
-        return _sessions.get(sid)
-
-
-def _reset_session(sid: str) -> None:
-    """Drop a session's conversation (the /new slash command)."""
-    with _sessions_lock:
-        if sid in _sessions:
-            _sessions[sid]["conversation"] = Conversation()
-
-
-def _get_or_create_session(cookie_header: str | None) -> tuple[str, bool]:
-    """Parse the session cookie or create a new one.
-
-    Returns (session_id, is_new).
+    format_prior_turns_for_llm uses attribute access, so dicts
+    don't work directly. This lightweight wrapper keeps the web
+    server free of conversation.py's heavier objects.
     """
-    if cookie_header:
-        cookies = http.cookies.SimpleCookie(cookie_header)
-        if "session" in cookies:
-            sid = cookies["session"].value
-            if _get_session(sid) is not None:
-                return sid, False
-    return _create_session(), True
+    __slots__ = ("role", "content")
 
-
-def _format_prior_turns_for_session(sid: str) -> str | None:
-    """Format the recent conversation for the LLM's prior-turn context.
-
-    Returns None if there are no prior turns.
-    """
-    sess = _get_session(sid)
-    if sess is None:
-        return None
-    conv = sess["conversation"]
-    if not conv.turns:
-        return None
-    # Pass everything except the most recent turn (which is the
-    # current user turn being processed).
-    return format_prior_turns_for_llm(conv.turns[:-1])
+    def __init__(self, role: str, content: str) -> None:
+        self.role = role
+        self.content = content
 
 
 # ---------------------------------------------------------------------------
@@ -128,34 +87,28 @@ class ChatHandler(BaseHTTPRequestHandler):
     # Helpers
     # ------------------------------------------------------------------
 
-    def _send_json(self, status: int, body: dict, set_cookie: str | None = None) -> None:
+    def _send_json(self, status: int, body: dict) -> None:
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
-        if set_cookie:
-            self.send_header("Set-Cookie", set_cookie)
         self.end_headers()
         self.wfile.write(payload)
 
     def _send_static(self, path: str) -> None:
         """Serve a file from web/. Returns False if not found."""
-        # Strip leading slash, normalize
         rel = path.lstrip("/")
-        # Prevent path traversal: reject anything with .. or absolute paths
         if ".." in rel.split("/") or rel.startswith("/"):
             self.send_error(400, "Bad path")
             return
         full = (WEB_DIR / rel).resolve()
-        # Ensure the resolved path is still under WEB_DIR
         if not str(full).startswith(str(WEB_DIR.resolve())):
             self.send_error(400, "Bad path")
             return
         if not full.is_file():
             self.send_error(404, "Not found")
             return
-        # Guess content type
         ext = full.suffix.lower()
         ctype = {
             ".html": "text/html; charset=utf-8",
@@ -188,6 +141,26 @@ class ChatHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"Invalid JSON: {e}"})
             return None
 
+    @staticmethod
+    def _validate_prior_turn(turn: Any) -> tuple[str, str] | None:
+        """Validate one prior turn from the request body.
+
+        Returns (role, content) on success, or None if invalid.
+        Silently rejects malformed turns — the server is permissive
+        and just ignores the bad ones.
+        """
+        if not isinstance(turn, dict):
+            return None
+        role = turn.get("role")
+        content = turn.get("content")
+        if role not in ("user", "assistant"):
+            return None
+        if not isinstance(content, str):
+            return None
+        if len(content) > 20000:  # ~20KB cap per turn
+            return None
+        return role, content
+
     # ------------------------------------------------------------------
     # Routing
     # ------------------------------------------------------------------
@@ -205,12 +178,13 @@ class ChatHandler(BaseHTTPRequestHandler):
         if path == "/api/help":
             self._send_json(200, {
                 "commands": [
-                    {"name": "new", "description": "Clear the conversation"},
+                    {"name": "new", "description": "Start a fresh conversation (clears client-side history)"},
                     {"name": "help", "description": "Show this help"},
                 ],
                 "notes": [
-                    "The web UI hides historical chats by default.",
-                    "Use the 'New Chat' button (top-right) to start fresh.",
+                    "Conversation history is stored in your browser only.",
+                    "Use the 'New Chat' button to start fresh.",
+                    "Refreshing the page keeps your conversation (localStorage).",
                 ],
             })
             return
@@ -220,41 +194,55 @@ class ChatHandler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         path = url.path
 
-        # Get or create session
-        sid, is_new = _get_or_create_session(self.headers.get("Cookie"))
-        cookie_header = f"session={sid}; Path=/; HttpOnly; SameSite=Lax"
-
         if path == "/api/chat":
             body = self._read_json_body()
             if body is None:
                 return  # already sent 4xx
-            question = (body.get("question") or "").strip()
-            if not question:
-                self._send_json(400, {"error": "Empty question"}, set_cookie=cookie_header)
-                return
-            self._handle_chat(sid, question, is_new, cookie_header)
-            return
-
-        if path == "/api/reset":
-            _reset_session(sid)
-            self._send_json(200, {"status": "ok", "message": "Conversation reset"}, set_cookie=cookie_header)
+            self._handle_chat(body)
             return
 
         self.send_error(404, "Not found")
 
-    def _handle_chat(self, sid: str, question: str, is_new: bool, cookie_header: str) -> None:
-        """Process a chat question: rewrite, classify, execute, synthesize."""
-        sess = _get_session(sid)
-        if sess is None:
-            self._send_json(500, {"error": "Session lost"}, set_cookie=cookie_header)
+    def _handle_chat(self, body: dict) -> None:
+        """Process a chat question with optional prior-turn context.
+
+        Request body:
+          {
+            "question": "...",
+            "prior_turns": [
+              {"role": "user"|"assistant", "content": "..."},
+              ...
+            ]  # optional
+          }
+
+        Response:
+          {"answer": "..."}
+        """
+        question = (body.get("question") or "").strip()
+        if not question:
+            self._send_json(400, {"error": "Empty question"})
             return
-        conv = sess["conversation"]
 
-        # Record the user turn
-        conv.add_user_turn(question)
+        # Build a minimal Conversation-like object to feed format_prior_turns_for_llm.
+        # The web client is stateless, but the LLM still needs the prior-turn
+        # context to handle multi-turn correctly. We synthesize the structure
+        # from the request body.
+        prior_turns_raw = body.get("prior_turns") or []
+        if not isinstance(prior_turns_raw, list):
+            self._send_json(400, {"error": "prior_turns must be a list"})
+            return
 
-        # Format prior turns for LLM context
-        prior_turns_str = format_prior_turns_for_llm(conv.turns[:-1])
+        # Cap to last MAX_PRIOR_TURNS to keep prompt size bounded.
+        MAX_PRIOR_TURNS = 20
+        validated_turns = []
+        for t in prior_turns_raw[-MAX_PRIOR_TURNS:]:
+            v = self._validate_prior_turn(t)
+            if v is not None:
+                role, content = v
+                validated_turns.append(_PriorTurn(role, content))
+        prior_turns_str = (
+            format_prior_turns_for_llm(validated_turns) if validated_turns else None
+        )
 
         try:
             answer = chat.answer_question(
@@ -269,25 +257,12 @@ class ChatHandler(BaseHTTPRequestHandler):
         except Exception as e:
             answer = f"Error: {e}"
 
-        # Record the assistant turn
-        conv.add_assistant_turn(answer)
-
-        self._send_json(200, {
-            "answer": answer,
-            "is_new_session": is_new,
-        }, set_cookie=cookie_header)
+        self._send_json(200, {"answer": answer})
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-
-
-def make_handler_class() -> type:
-    """Return a ChatHandler subclass with the server's settings baked in."""
-    class _Handler(ChatHandler):
-        pass
-    return _Handler
 
 
 def main() -> int:
@@ -314,7 +289,6 @@ def main() -> int:
         print(f"Error: web/ directory not found at {WEB_DIR}", file=sys.stderr)
         return 1
 
-    # Configure the handler class with server-side settings
     ChatHandler.server_db_path = db_path
     ChatHandler.server_chroma_dir = chroma_dir
     ChatHandler.server_use_llm_tool_fallback = not args.no_tool_llm

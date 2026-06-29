@@ -1,13 +1,18 @@
 /* Frontend for the Hello! Project Wiki chatbot.
  *
- * - POSTs user questions to /api/chat, renders Markdown responses
- * - "New Chat" button calls /api/reset (the /new slash command) and
- *   clears the visible chat window
- * - "?" button shows the help modal listing available commands
- * - Configures marked.js to safely render assistant Markdown
+ * Stateless design: the server holds no per-user state. We keep the
+ * conversation history in the browser (in-memory + localStorage)
+ * and send the prior turns with each /api/chat request.
  *
- * Note: per the user's spec, the web UI hides historical chats by
- * default. The empty-state at the start is the only "default" view.
+ * - Stores conversation history in JS state (and localStorage so
+ *   it survives page reloads)
+ * - "New Chat" button clears the local history and the visible chat
+ * - "?" button shows the help modal
+ * - Renders assistant Markdown via marked.js
+ *
+ * Per the user's spec: the web UI hides historical chats by default.
+ * Each browser (or browser tab, after a refresh) starts with an
+ * empty chat. The history is local to the browser.
  */
 
 (function () {
@@ -35,8 +40,45 @@
   const helpClose = document.getElementById("help-close");
   const helpList = document.getElementById("help-list");
 
-  // ---- State ----
+  // ---- State (in-memory, mirrored to localStorage) ----
+  // conversationHistory is a list of {role, content} objects.
+  // It is sent with each /api/chat request as prior_turns, so the
+  // server sees the full context but stores nothing.
+  const STORAGE_KEY = "helloproject-wiki-chat-history-v1";
+  let conversationHistory = loadHistory();
+
   let inFlight = false;
+
+  // ---- History persistence ----
+
+  function loadHistory() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) return [];
+      // Filter to valid turns only.
+      return parsed.filter(
+        (t) => t &&
+          (t.role === "user" || t.role === "assistant") &&
+          typeof t.content === "string"
+      );
+    } catch (e) {
+      // Corrupt localStorage data — start fresh.
+      return [];
+    }
+  }
+
+  function saveHistory() {
+    try {
+      // Cap to last 50 turns to keep localStorage small.
+      const trimmed = conversationHistory.slice(-50);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
+    } catch (e) {
+      // localStorage might be full or disabled (private mode).
+      // Best-effort only.
+    }
+  }
 
   // ---- Helpers ----
 
@@ -95,7 +137,6 @@
   }
 
   function clearMessages() {
-    // Remove all message children (but keep the empty-state element)
     while (messagesEl.firstChild) {
       messagesEl.removeChild(messagesEl.firstChild);
     }
@@ -109,7 +150,6 @@
     const opts = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      credentials: "same-origin",  // send the session cookie
       body: JSON.stringify(body),
     };
     const resp = await fetch(url, opts);
@@ -117,7 +157,6 @@
     try {
       data = await resp.json();
     } catch (e) {
-      // Non-JSON response (e.g., 4xx/5xx HTML). Surface as error.
       throw new Error("Server returned non-JSON response (" + resp.status + ")");
     }
     if (!resp.ok) {
@@ -127,9 +166,33 @@
   }
 
   async function getJson(url) {
-    const resp = await fetch(url, { credentials: "same-origin" });
+    const resp = await fetch(url);
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     return resp.json();
+  }
+
+  // ---- Render history on page load ----
+  // When the user reloads the page, the conversation is restored
+  // from localStorage and re-rendered. This is the "persistence
+  // across reloads" behavior the spec asked for.
+  function renderHistory() {
+    if (conversationHistory.length === 0) {
+      // Show the empty state
+      if (emptyStateEl) {
+        emptyStateEl.hidden = false;
+        if (messagesEl.firstChild !== emptyStateEl) {
+          messagesEl.appendChild(emptyStateEl);
+        }
+      }
+      return;
+    }
+    // Hide the empty state
+    if (emptyStateEl) {
+      emptyStateEl.hidden = true;
+    }
+    for (const turn of conversationHistory) {
+      appendMessage(turn.role, turn.content);
+    }
   }
 
   // ---- Form submission ----
@@ -141,14 +204,32 @@
     if (!q) return;
     inFlight = true;
     sendBtn.disabled = true;
+
+    // Render the user message immediately
     appendMessage("user", q);
+
+    // Add to history (this is the in-memory list that the server
+    // sees as prior_turns on the next request)
+    conversationHistory.push({ role: "user", content: q });
+    saveHistory();
+
     input.value = "";
     autoSize();
+
     const typing = appendTyping();
     try {
-      const data = await postJson("/api/chat", { question: q });
+      // Send question + the conversation history. The server is
+      // stateless; the prior_turns is the only context it sees.
+      const data = await postJson("/api/chat", {
+        question: q,
+        prior_turns: conversationHistory.slice(0, -1),  // exclude current turn
+      });
       typing.remove();
       appendMessage("assistant", data.answer);
+
+      // Add the assistant turn to history
+      conversationHistory.push({ role: "assistant", content: data.answer });
+      saveHistory();
     } catch (e) {
       typing.remove();
       const errBubble = appendMessage("assistant", "");
@@ -162,28 +243,23 @@
   }
 
   function autoSize() {
-    // Auto-grow the textarea up to its max-height
     input.style.height = "auto";
     input.style.height = Math.min(input.scrollHeight, 200) + "px";
   }
 
-  // ---- Slash-command emulation (for parity with REPL) ----
-  // "yes" / "no" / "thanks" are sent as plain text — the LLM will see
-  // the prior turns in context and respond appropriately. The /new
-  // command is bound to the New Chat button.
-
-  async function newChat() {
+  // ---- New Chat ----
+  // Clears the local conversation history and the visible chat.
+  // There's no server-side state to clear.
+  function newChat() {
     if (inFlight) return;
-    if (!confirm("Start a new conversation? This clears the current chat.")) {
+    if (conversationHistory.length > 0
+        && !confirm("Start a new conversation? This clears your current chat.")) {
       return;
     }
-    try {
-      await postJson("/api/reset", {});
-      clearMessages();
-      input.focus();
-    } catch (e) {
-      alert("Failed to reset: " + e.message);
-    }
+    conversationHistory = [];
+    saveHistory();
+    clearMessages();
+    input.focus();
   }
 
   async function showHelp() {
@@ -192,7 +268,7 @@
       helpList.innerHTML = "";
       for (const cmd of data.commands) {
         const li = document.createElement("li");
-        li.innerHTML = "<code>/" + escapeHtml(cmd.name) + "</code> — " + escapeHtml(cmd.description);
+        li.innerHTML = "<code>/" + escapeHtml(cmd.name) + "</code> &mdash; " + escapeHtml(cmd.description);
         helpList.appendChild(li);
       }
       helpModal.classList.remove("hidden");
@@ -211,7 +287,6 @@
     if (e.target === helpModal) helpModal.classList.add("hidden");
   });
 
-  // Keyboard: Enter sends, Shift+Enter newlines
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -220,7 +295,6 @@
   });
   input.addEventListener("input", autoSize);
 
-  // Click on a suggested question in the empty-state
   if (emptyStateEl) {
     emptyStateEl.addEventListener("click", (e) => {
       const li = e.target.closest("li");
@@ -231,6 +305,7 @@
     });
   }
 
-  // Focus the input on load
+  // Render any history from a previous session, then focus the input
+  renderHistory();
   input.focus();
 })();

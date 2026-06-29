@@ -695,12 +695,17 @@ def answer_question(
     llm: "LLMSynthesizer | None" = None,
     context: "Context | None" = None,
     on_tool_complete: "callable | None" = None,
+    prior_year: int | None = None,
 ) -> str:
     """Answer a single question end-to-end.
 
     If `context` is provided (a `conversation.Context` instance), the
     question will be rewritten using remembered entities before the
     classifier runs.
+
+    If `prior_year` is provided, temporal references like 'the next
+    year' will be rewritten to specific years (e.g., 'in 2011') using
+    prior_year as the anchor.
 
     If `on_tool_complete` is provided, it will be called as
     `on_tool_complete(tool_call, tool_result, answer)` after the tool
@@ -711,7 +716,9 @@ def answer_question(
     if context is not None:
         try:
             from conversation import prepare_question
-            question, notes = prepare_question(question, context, verbose=verbose)
+            question, notes = prepare_question(
+                question, context, verbose=verbose, prior_year=prior_year,
+            )
         except Exception as e:
             if verbose:
                 print(f"[context] prepare failed: {e}", file=sys.stderr)
@@ -906,6 +913,26 @@ def main() -> int:
                     else question
                 )
 
+                # Pull the year (if any) from the prior user turn so
+                # 'the next year' / 'the previous year' can be resolved
+                # to specific years ('in 2011') rather than abstract
+                # phrases ('the year after').
+                #
+                # Walk back through turns to find the most recent user
+                # turn before the current one. We can't just look at
+                # `conv.turns[-2]` because each prior turn is an
+                # interleaved user+assistant pair.
+                prior_year = None
+                if conv is not None and len(conv.turns) >= 2:
+                    try:
+                        from conversation import extract_year
+                        for prior_turn in reversed(conv.turns[:-1]):
+                            if prior_turn.role == "user":
+                                prior_year = extract_year(prior_turn.content)
+                                break
+                    except Exception:
+                        prior_year = None
+
                 def record_turn(call, result):
                     if not conv:
                         return
@@ -919,6 +946,7 @@ def main() -> int:
                     question_to_classify, db_path, chroma_dir,
                     verbose=args.verbose, llm=llm, context=ctx,
                     on_tool_complete=record_turn,
+                    prior_year=prior_year,
                 )
                 if conv and conv.turns and conv.turns[-1].role == "assistant":
                     conv.turns[-1].content = answer

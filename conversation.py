@@ -444,16 +444,33 @@ BARE_NOUN_QUERIES = {
 
 # Temporal/ordinal references that should be resolved against context.
 # These get rewritten to concrete phrases before classification.
+#
+# Year-anchored patterns use {next_year} / {prev_year} placeholders,
+# which are substituted with the actual year (e.g., "2011" if the
+# prior question was about 2010). Album-anchored patterns use
+# {last_album} which is bound from the Context's album_title.
 TEMPORAL_PATTERNS = [
-    # "the next year" / "the following year" -> "the year after"
-    (r"\bthe\s+next\s+year\b", "the year after"),
-    (r"\bthe\s+following\s+year\b", "the year after"),
-    (r"\bthe\s+previous\s+year\b", "the year before"),
-    (r"\bthe\s+year\s+before\b", "the year before"),
+    # "the next year" / "the following year" -> "in 2011" (or "the year after" if no prior year)
+    (r"\bthe\s+next\s+year\b", "{next_year}"),
+    (r"\bthe\s+following\s+year\b", "{next_year}"),
+    (r"\bthe\s+previous\s+year\b", "{prev_year}"),
+    (r"\bthe\s+year\s+before\b", "{prev_year}"),
     # "the next album" / "the previous single"
     (r"\bthe\s+next\s+(album|single|release)\b", "the {1} after {last_album}"),
     (r"\bthe\s+previous\s+(album|single|release)\b", "the {1} before {last_album}"),
 ]
+
+
+# Pattern for finding a 4-digit year in [1900, 2099] in text.
+YEAR_RE = re.compile(r"\b(19\d{2}|20\d{2})\b")
+
+
+def extract_year(text: str) -> int | None:
+    """Pull the first plausible year (1900-2099) out of text, if any."""
+    if not text:
+        return None
+    m = YEAR_RE.search(text)
+    return int(m.group(1)) if m else None
 
 
 @dataclass
@@ -517,13 +534,24 @@ def expand_bare_noun(
     return template.format(entity=entity), f"(expanded '{question}' to ask about {entity})"
 
 
-def resolve_temporal(question: str, ctx: Context) -> tuple[str, str | None]:
+def resolve_temporal(
+    question: str,
+    ctx: Context,
+    prior_year: int | None = None,
+) -> tuple[str, str | None]:
     """Resolve 'next year', 'previous album', etc. into concrete phrases.
 
-    Note: 'next year' after asking about 2003 means '2004'. We don't
-    know the exact year without LLM help, so we rephrase to a phrase
-    the data layer (or LLM) can use: 'the year after'. The downstream
-    answerer figures out the specific value.
+    Year references ('the next year', 'the previous year') are rewritten
+    to specific years when we know the prior year. For example, if the
+    prior question was about 2010, 'the next year' becomes 'in 2011'.
+    This is much more useful than 'the year after' because the rewritten
+    question is specific enough that semantic search finds relevant
+    content and the LLM doesn't have to guess.
+
+    Album references ('the next album', 'the previous single') get
+    substituted with the last album title from context.
+
+    Returns (rewritten_question, note).
     """
     notes: list[str] = []
     q = question
@@ -534,8 +562,30 @@ def resolve_temporal(question: str, ctx: Context) -> tuple[str, str | None]:
             continue
 
         new_replacement = replacement
+        # Substitute the captured group (e.g., "album" in
+        # "the next album") into "{1}".
         if "{1}" in new_replacement and m.group(1):
             new_replacement = new_replacement.replace("{1}", m.group(1))
+
+        # Year placeholders: only fill if we know the prior year.
+        if "{next_year}" in new_replacement:
+            if prior_year is not None:
+                next_y = prior_year + 1
+                new_replacement = new_replacement.replace("{next_year}", f"in {next_y}")
+                notes.append(f"(resolved 'next year' to {next_y} from prior {prior_year})")
+            else:
+                # Fall back to the abstract phrase; the LLM will have
+                # to figure it out from conversation context.
+                new_replacement = new_replacement.replace("{next_year}", "the year after")
+        if "{prev_year}" in new_replacement:
+            if prior_year is not None:
+                prev_y = prior_year - 1
+                new_replacement = new_replacement.replace("{prev_year}", f"in {prev_y}")
+                notes.append(f"(resolved 'previous year' to {prev_y} from prior {prior_year})")
+            else:
+                new_replacement = new_replacement.replace("{prev_year}", "the year before")
+
+        # Album placeholders.
         if "{last_album}" in new_replacement:
             if ctx.album_title:
                 new_replacement = new_replacement.replace("{last_album}", ctx.album_title)
@@ -608,18 +658,24 @@ def prepare_question(
     question: str,
     ctx: Context,
     verbose: bool = False,
+    prior_year: int | None = None,
 ) -> tuple[str, list[str]]:
     """Rewrite a raw user question using conversation context.
 
     Returns (rewritten_question, notes). The notes list contains
     human-readable strings describing each substitution, suitable for
     printing to stderr.
+
+    prior_year: if the prior user turn mentioned a year (e.g. 2010),
+    pass it so temporal references like 'the next year' can be
+    resolved to a specific year ('in 2011') instead of the abstract
+    phrase 'the year after'.
     """
     notes: list[str] = []
     q = question
 
-    # Step 0: temporal/ordinal resolution (e.g. "next year" -> "the year after")
-    q, note = resolve_temporal(q, ctx)
+    # Step 0: temporal/ordinal resolution (e.g. "next year" -> "in 2011")
+    q, note = resolve_temporal(q, ctx, prior_year=prior_year)
     if note:
         notes.append(note)
 

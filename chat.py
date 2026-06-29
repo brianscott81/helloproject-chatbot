@@ -693,8 +693,29 @@ def answer_question(
     chroma_dir: Path,
     verbose: bool = False,
     llm: "LLMSynthesizer | None" = None,
+    context: "Context | None" = None,
+    on_tool_complete: "callable | None" = None,
 ) -> str:
-    """Answer a single question end-to-end."""
+    """Answer a single question end-to-end.
+
+    If `context` is provided (a `conversation.Context` instance), the
+    question will be rewritten using remembered entities before the
+    classifier runs.
+
+    If `on_tool_complete` is provided, it will be called as
+    `on_tool_complete(tool_call, tool_result, answer)` after the tool
+    executes but before synthesis. Used by the REPL to record turns
+    into a Conversation without re-running classify/execute.
+    """
+    notes: list[str] = []
+    if context is not None:
+        try:
+            from conversation import prepare_question
+            question, notes = prepare_question(question, context, verbose=verbose)
+        except Exception as e:
+            if verbose:
+                print(f"[context] prepare failed: {e}", file=sys.stderr)
+
     if verbose:
         print(f"[classify] question={question!r}", file=sys.stderr)
 
@@ -705,6 +726,13 @@ def answer_question(
     result = execute_tool_call(db_path, chroma_dir, call)
     if verbose:
         print(f"[tool_result] {json.dumps(result, indent=2, ensure_ascii=False)[:1500]}", file=sys.stderr)
+
+    if on_tool_complete is not None:
+        try:
+            on_tool_complete(call, result)
+        except Exception as e:
+            if verbose:
+                print(f"[callback] failed: {e}", file=sys.stderr)
 
     return synthesize_answer(question, result, tool_name=call.get("tool"), llm=llm, verbose=verbose)
 
@@ -743,13 +771,92 @@ def main() -> int:
         print("Hello! Project Wiki chatbot. Ask questions (Ctrl-D to exit).")
         if llm and llm.available:
             print(f"[LLM: {llm.provider}]")
+        print("Slash commands: /new, /history, /last, /help")
+        print()
+        try:
+            from conversation import Conversation, parse_input
+            conv = Conversation()
+        except Exception as e:
+            print(f"[conv] init failed: {e}; running single-turn mode", file=sys.stderr)
+            conv = None
+
         try:
             while True:
-                q = input("\n> ").strip()
-                if not q:
+                try:
+                    raw = input("> ").strip()
+                except EOFError:
+                    raise
+                if not raw:
                     continue
-                a = answer_question(q, db_path, chroma_dir, verbose=args.verbose, llm=llm)
-                print(a)
+
+                parsed = parse_input(raw)
+                if parsed.is_command:
+                    cmd = parsed.command
+                    if cmd in ("exit", "quit"):
+                        print("(exiting)")
+                        return 0
+                    elif cmd == "new":
+                        if conv:
+                            conv.reset()
+                        print("(conversation reset)")
+                    elif cmd == "history":
+                        if not conv:
+                            print("(no conversation state)")
+                        else:
+                            print(conv.format_history())
+                    elif cmd == "last":
+                        # alias for /history for backward compat
+                        if not conv:
+                            print("(no conversation state)")
+                        else:
+                            print(conv.format_history())
+                    elif cmd == "ctx":
+                        if not conv:
+                            print("(no conversation state)")
+                        else:
+                            print(conv.format_context())
+                    elif cmd == "help":
+                        print("Slash commands:")
+                        print("  /new      Start a new conversation (clear history and context)")
+                        print("  /history  Show the last few turns of conversation")
+                        print("  /ctx      Show currently remembered entities")
+                        print("  /help     Show this message")
+                        print("  /exit     Quit the REPL (Ctrl-D also works)")
+                        print()
+                        print("Anything else is treated as a question.")
+                    else:
+                        print(f"Unknown command: /{cmd}. Try /help.")
+                    continue
+
+                # It's a question.
+                question = parsed.raw
+                if conv:
+                    conv.add_user_turn(question)
+
+                ctx = conv.context if conv else None
+
+                # Build the turn-recorder callback. This runs once, after
+                # the tool executes, so the conversation memory gets the
+                # result without us re-running classify/execute.
+                def record_turn(call, result):
+                    if not conv:
+                        return
+                    conv.add_assistant_turn(
+                        "(pending)",
+                        tool_name=call.get("tool"),
+                        tool_result=result,
+                    )
+
+                answer = answer_question(
+                    question, db_path, chroma_dir,
+                    verbose=args.verbose, llm=llm, context=ctx,
+                    on_tool_complete=record_turn,
+                )
+                # Update the just-recorded turn with the actual answer text
+                # (we didn't have it when record_turn fired).
+                if conv and conv.turns and conv.turns[-1].role == "assistant":
+                    conv.turns[-1].content = answer
+                print(answer)
         except (EOFError, KeyboardInterrupt):
             print()
         return 0

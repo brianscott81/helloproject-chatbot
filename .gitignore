@@ -25,3 +25,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+# Visual Studio (Windows IDE — creates .vs/ cache and .slnx.sqlite sidecar)
+.vs/
+slnx.sqlite

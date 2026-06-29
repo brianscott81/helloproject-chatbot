@@ -204,6 +204,37 @@ def tool_get_tracklist(conn, release_title: str) -> dict:
     }
 
 
+# Module-level cache for the embedding model and chroma client.
+# Avoids reloading SentenceTransformer (~400MB in RAM) on every
+# semantic search request, which would be very slow.
+_EMBEDDING_MODEL = None
+_CHROMA_CLIENT = None
+_CHROMA_COLLECTION = None
+
+
+def _get_chroma_collection(chroma_dir: Path):
+    """Return the chroma collection, opening the client on first call.
+
+    Caches the client and collection so subsequent calls don't pay
+    the I/O cost of re-opening the persistent store.
+    """
+    global _CHROMA_CLIENT, _CHROMA_COLLECTION
+    if _CHROMA_COLLECTION is None:
+        import chromadb
+        _CHROMA_CLIENT = chromadb.PersistentClient(path=str(chroma_dir))
+        _CHROMA_COLLECTION = _CHROMA_CLIENT.get_collection("helloproject")
+    return _CHROMA_COLLECTION
+
+
+def _get_embedding_model():
+    """Return the cached SentenceTransformer model, loading on first use."""
+    global _EMBEDDING_MODEL
+    if _EMBEDDING_MODEL is None:
+        from sentence_transformers import SentenceTransformer
+        _EMBEDDING_MODEL = SentenceTransformer("BAAI/bge-small-en-v1.5")
+    return _EMBEDDING_MODEL
+
+
 def tool_semantic_search(
     chroma_dir: Path,
     query: str,
@@ -218,20 +249,25 @@ def tool_semantic_search(
     template, which we strip from the embedding chunks to keep them
     clean. Augmenting with infobox data gives the LLM everything it
     needs without re-embedding.
+
+    The embedding model and chroma client are cached at module level
+    so the first request after startup pays the load cost, and
+    subsequent requests are fast.
     """
     if not chroma_dir.exists():
         return {"error": "Vector index not built. Run build_embeddings.py first."}
 
-    import chromadb
-    from sentence_transformers import SentenceTransformer
+    try:
+        collection = _get_chroma_collection(chroma_dir)
+    except Exception as e:
+        return {"error": f"Failed to open vector index: {e}"}
 
-    client = chromadb.PersistentClient(path=str(chroma_dir))
-    collection = client.get_collection("helloproject")
-
-    # Embed the query. We re-use the same model — for v1 we just reload.
-    # In production we'd cache this model in a singleton.
-    model = SentenceTransformer("BAAI/bge-small-en-v1.5")
-    q_emb = model.encode([query]).tolist()
+    # Embed the query using the cached model.
+    try:
+        model = _get_embedding_model()
+        q_emb = model.encode([query]).tolist()
+    except Exception as e:
+        return {"error": f"Failed to embed query: {e}"}
 
     # Fetch extra results so we can deduplicate by page and surface more
     # diverse pages.

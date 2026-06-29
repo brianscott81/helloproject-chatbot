@@ -18,6 +18,12 @@ openai>=1.0.0,<3.0
 # ChromaDB (vector storage). 1.x is the current major.
 chromadb>=1.0,<2.0
 
+# sentence-transformers is needed at runtime by tool_semantic_search
+# in chat.py. It dynamically loads SentenceTransformer to embed the
+# user's query. The model we use is BAAI/bge-small-en-v1.5.
+sentence-transformers>=3.0,<5.0
+
 # numpy is a transitive dep but it's used in some template formatters
 # for chunk manipulation, so pin it explicitly.
 numpy>=1.24,<3.0
+

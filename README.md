@@ -147,3 +147,63 @@ The following are listed in `.gitignore` and rebuilt from the source XML dump:
 - `build.log`, `build_emb.log`
 
 To regenerate them: see **Quick start** above.
+
+## Deployment
+
+The web interface is a single Python process that can be deployed to any
+host that runs Docker. The repo includes a `Dockerfile` and a
+`fly.toml` for the simplest path: [Fly.io](https://fly.io).
+
+### Deploy to Fly.io
+
+Prerequisites:
+- `flyctl` CLI: <https://fly.io/docs/hands-on/install-flyctl/>
+- A Fly.io account: `fly auth signup`
+- Pre-built indexes (`helloproject.db` and `chroma/`) on your machine
+
+Steps:
+```bash
+# One-time: launch the app (no deploy yet)
+fly launch --no-deploy
+
+# Set LLM env vars (skip if you want template-only mode)
+fly secrets set \
+  ANTHROPIC_BASE_URL=https://api.your-llm-provider.com/v1 \
+  ANTHROPIC_AUTH_TOKEN=your-token
+
+# Deploy
+fly deploy
+```
+
+After deploy, your app is reachable at `https://<app-name>.fly.dev`.
+
+The provided `deploy.sh` wraps these commands:
+```bash
+./deploy.sh                  # full deploy
+./deploy.sh --no-llm         # template-only mode (no LLM)
+./deploy.sh --logs           # deploy then tail logs
+```
+
+### Deploy anywhere with Docker
+
+```bash
+docker build -t helloproject-wiki .
+docker run --rm -p 8000:8000 \
+  -e ANTHROPIC_BASE_URL=https... \
+  -e ANTHROPIC_AUTH_TOKEN=*** \
+  helloproject-wiki
+```
+
+The image is ~600MB and includes the pre-built SQLite + ChromaDB
+indexes. For a clean image without the indexes, comment out the
+relevant `COPY` lines in the `Dockerfile` and run the build scripts
+on first boot (slower, ~25 minutes for the ChromaDB index).
+
+### Session state
+
+Sessions are kept in memory in the running process. If you deploy a
+single instance (the default), this is fine. If you scale to multiple
+instances, sessions will not be shared — users may get disconnected
+on a deploy restart, and a request could hit a different VM than
+the one that holds their session. To fix this, add a Redis-backed
+session store. For a single-user tool, the default is fine.

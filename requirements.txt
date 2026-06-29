@@ -1,0 +1,23 @@
+# Runtime dependencies for the Hello! Project Wiki chatbot.
+#
+# These are the *direct* dependencies. Transitive dependencies are
+# resolved by pip automatically.
+#
+# Build-time dependencies (mwxml, mwparserfromhell, tiktoken) are
+# NOT listed here because they're only needed by build_index.py and
+# build_embeddings.py, which are run locally before deployment. The
+# runtime just loads the pre-built indexes.
+
+# Anthropic SDK (used for MiniMax via the Anthropic-compat endpoint,
+# and for real Anthropic).
+anthropic>=0.85.0,<1.0
+
+# OpenAI SDK (used for real OpenAI and Ollama via OpenAI-compat).
+openai>=1.0.0,<3.0
+
+# ChromaDB (vector storage). 1.x is the current major.
+chromadb>=1.0,<2.0
+
+# numpy is a transitive dep but it's used in some template formatters
+# for chunk manipulation, so pin it explicitly.
+numpy>=1.24,<3.0

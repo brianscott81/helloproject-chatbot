@@ -1,0 +1,111 @@
+# Fly.io configuration for the Hello! Project Wiki chatbot.
+#
+# This file is for the Fly.io platform: https://fly.io
+#
+# Initial setup (one time):
+#   1. Install flyctl: https://fly.io/docs/hands-on/install-flyctl/
+#   2. Sign in: fly auth signup   (or: fly auth login)
+#   3. Launch the app for the first time:
+#        fly launch --no-deploy
+#        # Answer the prompts. When asked for the app name, pick
+#        # something like helloproject-wiki. Region: pick closest to you.
+#        # When asked "Would you like to set up a Postgresql database?"
+#        # say no (we use SQLite + ChromaDB on disk).
+#        # When asked "Would you like to set up a Redis database?"
+#        # say no.
+#   4. Create a persistent volume for the indexes (in case you need
+#      to redeploy with fresh data):
+#        fly volumes create helloproject_data --size 1
+#   5. Set the LLM env vars (replace with your real values):
+#        fly secrets set \
+#          ANTHROPIC_BASE_URL=https://api.minimax.io/v1 \
+#          ANTHROPIC_AUTH_TOKEN=your-token-here
+#      For template-only mode (no LLM), you can skip this step and
+#      pass --no-llm at runtime.
+#   6. Deploy:
+#        fly deploy
+#
+# After the first deploy, the app should be reachable at
+# https://<app-name>.fly.dev
+
+# The app name. Must be globally unique on Fly.io.
+app = "helloproject-wiki"
+
+# Primary region. Pick one close to you. See https://fly.io/docs/reference/regions/
+primary_region = "iad"
+
+# VM configuration. shared-cpu-1x with 1GB RAM is the free tier
+# (currently: shared-cpu-1x, 1GB RAM, 3GB storage, 160GB transfer/mo).
+# Bump to dedicated-cpu-1x or larger machines for production loads.
+[build]
+  # Build context is the current directory; uses the Dockerfile.
+  dockerfile = "Dockerfile"
+
+[env]
+  # Default to template formatters. Remove this and set the LLM env
+  # vars via `fly secrets` to enable LLM synthesis.
+  PORT = "8000"
+
+  # Pre-built indexes ship in the image. If you ever need to wipe
+  # them and rebuild on first boot, set this to "0".
+  SKIP_INDEX_BUNDLE = "1"
+
+[experimental]
+  # Auto-suspend after 5 minutes of no inbound traffic. Costs nothing
+  # while suspended. Cold start is ~3-5 seconds.
+  auto_rollback = true
+
+[[services]]
+  protocol = "tcp"
+  internal_port = 8000
+  processes = ["app"]
+
+  # Auto-stop machines on idle (free tier friendly).
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  # Health checks. Fly.io calls /api/help every 30s; if it fails 3
+  # times, the VM is restarted.
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 100
+    soft_limit = 80
+
+  [[services.tcp_checks]]
+    grace_period = "10s"
+    interval = "30s"
+    timeout = "5s"
+
+  [[services.http_checks]]
+    path = "/api/help"
+    grace_period = "10s"
+    interval = "30s"
+    timeout = "5s"
+    method = "GET"
+    status = 200
+
+# Persistent volume for the indexes. The Dockerfile already COPYs the
+# indexes in, so this is only needed if you ever want to switch to
+# "build on first boot" mode. Uncomment the [mount] block below to
+# enable.
+#
+# [mounts]
+#   source = "helloproject_data"
+#   destination = "/data"
+
+# Single VM for now. Session state is in-memory; multi-VM would
+# require sticky sessions or shared session store.
+[[vm]]
+  cpu_kind = "shared"
+  cpus = 1
+  memory_mb = 1024

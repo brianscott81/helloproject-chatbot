@@ -1,0 +1,52 @@
+# Docker build context exclusions. Files here are NOT sent to the
+# Docker daemon during `docker build`. This keeps the build context
+# small and the build fast.
+#
+# Note: this is NOT the same as .gitignore. .gitignore controls
+# what gets tracked by git; .dockerignore controls what gets
+# included in the build context. They're independent.
+
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+.Python
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+.vs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build / test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+build.log
+build_emb.log
+
+# Documentation source (not needed at runtime)
+docs/
+
+# Git itself
+.git/
+.gitignore
+.gitattributes
+
+# This file and other config that shouldn't ship
+.dockerignore
+fly.toml
+render.yaml
+
+# Local environment overrides
+.env
+.env.local

@@ -383,15 +383,44 @@ def call_anthropic(
         default_model = "MiniMax-M3"
     model = model or os.environ.get("HELLO_PROJECT_ANTHROPIC_MODEL", default_model)
 
-    # Build the client. Pass auth_token explicitly when we don't have a
-    # real Anthropic api_key — that way the SDK sends x-api-key only if
-    # we set it, and the proxy (MiniMax) gets its expected auth header.
+    # Build the client.
+    # The Anthropic SDK has two auth styles:
+    #   - api_key:     sets `x-api-key` header  (real Anthropic)
+    #   - auth_token:  sets `Authorization: Bearer ...` header  (proxies)
+    # MiniMax's proxy returns 401 with `auth_token` and demands the
+    # token in `X-Api-Key` (note the case). Some proxies need a
+    # custom header. We support both:
+    #   - By default (no override), if ANTHROPIC_AUTH_TOKEN is set
+    #     we pass it as auth_token (Bearer).
+    #   - If ANTHROPIC_USE_X_API_KEY=1, we pass the same token via
+    #     api_key instead, which makes the SDK send `x-api-key`.
+    #   - If ANTHROPIC_CUSTOM_AUTH_HEADER is set, we add it as an
+    #     extra default header on top of the default auth.
+    use_x_api_key = os.environ.get("ANTHROPIC_USE_X_API_KEY") == "1"
     if api_key:
         client_kwargs = {"api_key": api_key}
-    else:
+    elif use_x_api_key and auth_token:
+        client_kwargs = {"api_key": auth_token}
+    elif auth_token:
         client_kwargs = {"auth_token": auth_token}
+    else:
+        log.warning("Neither ANTHROPIC_API_KEY nor ANTHROPIC_AUTH_TOKEN is set")
+        return None
     if base_url:
         client_kwargs["base_url"] = base_url
+
+    # Optional: add a custom auth header on top of whatever the SDK
+    # already does. Format: "HeaderName:HeaderValue"
+    # Example: "X-Api-Key:sk-123"  (in addition to the default auth)
+    custom_auth_header = os.environ.get("ANTHROPIC_CUSTOM_AUTH_HEADER")
+    if custom_auth_header and ":" in custom_auth_header:
+        hdr_name, hdr_value = custom_auth_header.split(":", 1)
+        hdr_name = hdr_name.strip()
+        hdr_value = hdr_value.strip()
+        # Merge with any default_headers already set
+        existing = client_kwargs.get("default_headers", {})
+        existing[hdr_name] = hdr_value
+        client_kwargs["default_headers"] = existing
 
     client = Anthropic(**client_kwargs)
 
@@ -706,12 +735,25 @@ def select_tool_with_llm(
     api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
     base_url = os.environ.get("ANTHROPIC_BASE_URL")
 
+    use_x_api_key = os.environ.get("ANTHROPIC_USE_X_API_KEY") == "1"
     if os.environ.get("ANTHROPIC_API_KEY"):
-        client_kwargs = {"api_key": api_key}
+        client_kwargs = {"api_key": os.environ["ANTHROPIC_API_KEY"]}
+    elif use_x_api_key and os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        client_kwargs = {"api_key": os.environ["ANTHROPIC_AUTH_TOKEN"]}
     else:
         client_kwargs = {"auth_token": api_key}
     if base_url:
         client_kwargs["base_url"] = base_url
+
+    # Optional: add a custom auth header.
+    custom_auth_header = os.environ.get("ANTHROPIC_CUSTOM_AUTH_HEADER")
+    if custom_auth_header and ":" in custom_auth_header:
+        hdr_name, hdr_value = custom_auth_header.split(":", 1)
+        hdr_name = hdr_name.strip()
+        hdr_value = hdr_value.strip()
+        existing = client_kwargs.get("default_headers", {})
+        existing[hdr_name] = hdr_value
+        client_kwargs["default_headers"] = existing
 
     client = Anthropic(**client_kwargs)
 

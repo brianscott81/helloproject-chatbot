@@ -77,6 +77,42 @@ def _resolve_entity(conn, name: str, entity_type: str) -> dict | None:
     }
 
 
+# Patterns for member-list extraction from chunk text. The wiki uses
+# these formats for listing members in section bodies:
+#   *Ishiguro Aya        (single-word prefix, capitalized name)
+#   * [[Name]]           (wikilink form, but wikilinks are stripped before
+#                          embedding, so this appears as "*Name")
+#   Ishiguro Aya         (just the name on a line, no bullet)
+# Members are typically "Firstname Lastname" — two Title-Case words.
+# Chunks can have multiple bullets on a single line, so the asterisk is
+# matched as a separator rather than a line-anchor.
+_MEMBER_BULLET_PATTERN = re.compile(
+    r"\*\s*([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)+)"
+)
+
+
+def _extract_candidate_names_from_text(text: str, section: str = "") -> list[str]:
+    """Pull candidate entity names from chunk text.
+
+    Looks for patterns like '*Name' bullets and 2+ Title-Case words.
+    The candidates are then resolved to page IDs via the DB to confirm
+    they're real entities.
+
+    Only fires for member-related sections to avoid noise.
+    """
+    if not text:
+        return []
+    candidates: list[str] = []
+
+    # Pattern 1: bullet-style member lists (*Name)
+    for m in _MEMBER_BULLET_PATTERN.finditer(text):
+        name = m.group(1).strip()
+        if name and name not in candidates:
+            candidates.append(name)
+
+    return candidates
+
+
 def _add_entity(entities: list[dict], seen: set,
                 name: str, entity_type: str, page_id: int | None = None) -> None:
     """Add an entity to the list if not already present (by page_id or name).
@@ -312,8 +348,37 @@ def extract_meta(tool_result: dict, db_path: Path | None = None) -> dict:
                                         resolved["name"], resolved["type"],
                                         resolved["page_id"])
                     else:
-                        # Without DB, just add the name without page_id.
                         _add_entity(entities, seen_entities, value, etype, None)
+
+                # For member-related sections, also pull candidate names
+                # from the chunk text. The wiki lists members like:
+                #   *Ishiguro Aya *Iida Kaori *Yaguchi Mari
+                # which appear in chunk text without wikilink markers
+                # (the embedding chunks have wikilinks stripped). Each
+                # candidate is resolved to a page_id via the DB so we
+                # only surface names that actually exist in the wiki.
+                section = (chunk.get("section") or "").lower()
+                chunk_text = chunk.get("text", "")
+                if section and any(
+                    kw in section for kw in (
+                        "member", "lineup", "line-up", "generation",
+                    )
+                ):
+                    candidates = _extract_candidate_names_from_text(
+                        chunk_text, section,
+                    )
+                    if conn is not None:
+                        for cand in candidates:
+                            # Members can also be artists, albums, etc.
+                            # Try "member" first, fall back to "page".
+                            resolved = _resolve_entity(conn, cand, "member")
+                            if not resolved:
+                                resolved = _resolve_entity(conn, cand, "page")
+                            if resolved:
+                                _add_entity(entities, seen_entities,
+                                            resolved["name"],
+                                            resolved["type"],
+                                            resolved["page_id"])
 
         # Cap the lists
         entities = entities[:_MAX_ENTITIES]

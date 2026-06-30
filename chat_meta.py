@@ -20,6 +20,7 @@ behavior is unchanged. The web app is the only caller.
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,57 @@ _MAX_ENTITIES = 15
 # can return up to 5 chunks but each chunk is a different page, so
 # 5-10 is typical.
 _MAX_SOURCES = 10
+
+# Maximum length of a Title Case phrase we'll try to link. 6 words
+# covers almost all real entity names including long ones like
+# "Minimoni Seal Harun da Pyon!" (5 words). Going longer is rarely
+# useful and slows tokenization.
+_MAX_PHRASE_WORDS = 6
+
+
+# Common English words that the wiki happens to have pages for but
+# shouldn't be linked in normal prose. Months and days are obvious
+# noise when they appear as dates; pronouns are sentence-starts.
+# (W and HiP are intentionally NOT in this list — they're real HiP-
+# Project entities that users do want linked.)
+_LINK_SKIPLIST = frozenset({
+    "April", "August", "December", "February", "Friday", "January",
+    "July", "June", "March", "May", "Monday", "November", "October",
+    "Saturday", "September", "Sunday", "Thursday", "Tuesday", "Wednesday",
+})
+
+
+@lru_cache(maxsize=1)
+def _load_title_index(db_path: str) -> dict[str, int]:
+    """Load all page titles into a lowercase -> page_id dict.
+
+    The wiki has ~12k pages and the dict fits in ~500KB. Built once
+    and cached for the process lifetime via lru_cache. Subsequent
+    requests do a single dict lookup per Title Case phrase.
+
+    Returns {} if the DB doesn't exist or can't be read. Callers
+    should treat that as "no index available" and fall back gracefully.
+    """
+    try:
+        path = Path(db_path)
+        if not path.exists():
+            return {}
+        with connect(path) as conn:
+            rows = conn.execute(
+                "SELECT id, title FROM pages"
+            ).fetchall()
+        return {row["title"].lower(): row["id"] for row in rows}
+    except Exception:
+        return {}
+
+
+def _invalidate_title_index(db_path: str | Path) -> None:
+    """Drop the cached title index for this DB path.
+
+    Call this after build_index.py runs (since it changes the page
+    IDs and titles). The next call to _load_title_index will rebuild.
+    """
+    _load_title_index.cache_clear()
 
 
 def _wiki_url(page_title: str) -> str:
@@ -222,9 +274,11 @@ def extract_entities_from_prose(
 ) -> list[dict]:
     """Extract additional entities from the LLM's response text.
 
-    Scans for Title Case word patterns (1-3 capitalized words). Each
-    candidate is resolved to a wiki page via the DB. Names that don't
-    resolve (e.g., "April", "Tokyo", "Japan") are filtered out.
+    Uses a maximal-munch tokenizer over Title Case phrases. At each
+    position, tries the longest Title Case phrase (up to 4 words) that
+    exists as a wiki page in the title index. The longest match wins,
+    so we link "Minimoni Seal Harun da Pyon!" rather than just
+    "Minimoni".
 
     This is a second pass that runs AFTER synthesis, complementing
     extract_meta which runs on the structured tool result. Together
@@ -242,7 +296,9 @@ def extract_entities_from_prose(
     if not text or db_path is None or not db_path.exists():
         return []
 
-    candidates = _extract_candidate_names_from_prose(text)
+    title_index = _load_title_index(str(db_path))
+    if not title_index:
+        return []
 
     # Build a set of page_ids and names already extracted so we skip them.
     existing_page_ids: set[int] = set()
@@ -253,38 +309,158 @@ def extract_entities_from_prose(
         if e.get("name"):
             existing_names_lower.add(e["name"].lower())
 
+    matched_names = _tokenize_for_entities(text, title_index)
+
     entities: list[dict] = []
     seen_page_ids: set[int] = set()
     seen_names: set[str] = set()
 
-    try:
-        with connect(db_path) as conn:
-            for cand in candidates:
-                # Skip if already covered
-                if cand.lower() in existing_names_lower:
-                    continue
-                page = resolve_title(conn, cand)
-                if not page:
-                    continue
-                # Skip if already covered by page_id
-                if page.id in existing_page_ids or page.id in seen_page_ids:
-                    continue
-                if page.title.lower() in seen_names:
-                    continue
-                seen_page_ids.add(page.id)
-                seen_names.add(page.title.lower())
-                entities.append({
-                    "name": page.title,
-                    "type": "page",
-                    "page_id": page.id,
-                    "url": _wiki_url(page.title),
-                })
-                if len(entities) >= _MAX_ENTITIES:
-                    break
-    except Exception:
-        pass  # best-effort
+    for canonical_name in matched_names:
+        key = canonical_name.lower()
+        if key in existing_names_lower or key in seen_names:
+            continue
+        page_id = title_index.get(key)
+        if page_id is None or page_id in existing_page_ids or page_id in seen_page_ids:
+            continue
+        seen_page_ids.add(page_id)
+        seen_names.add(key)
+        entities.append({
+            "name": canonical_name,
+            "type": "page",
+            "page_id": page_id,
+            "url": _wiki_url(canonical_name),
+        })
+        if len(entities) >= _MAX_ENTITIES:
+            break
 
     return entities
+
+
+# Pattern that matches a Title Case word OR a common function-word
+# particle (da, de, of, no) that appears in multi-word wiki titles like
+# "Minimoni Seal Harun da Pyon!" or "Ikitaku Naru Made no Matter".
+# The particle is matched but only consumed if the surrounding phrase
+# actually exists in the title index. If not, the phrase with the
+# particle is rejected and we try without it.
+_TITLE_WORD_PATTERN = re.compile(r"[A-Z][a-zA-Z]*(?:[!?][!?]?)?|[Dd]a|[Dd]e|[Oo]f|[Nn]o")
+
+
+def _tokenize_for_entities(text: str, title_index: dict[str, int]) -> list[str]:
+    """Walk text and find Title Case phrases that match wiki pages.
+
+    Uses maximal-munch tokenization: at each position, try the longest
+    Title Case phrase (up to _MAX_PHRASE_WORDS words) that exists in
+    the index. If a match is found, advance past it. If no match is
+    found at a position, skip a character and try again.
+
+    The result is a list of canonical page titles (the casing from
+    the index, not the original text).
+    """
+    if not text or not title_index:
+        return []
+
+    # Pre-compute spans of Title Case words in the text. Each entry
+    # is (start, end, word). We use this so tokenization can scan
+    # by character position without re-running regex repeatedly.
+    word_spans: list[tuple[int, int, str]] = []
+    for m in _TITLE_WORD_PATTERN.finditer(text):
+        word_spans.append((m.start(), m.end(), m.group(0)))
+
+    if not word_spans:
+        return []
+
+    results: list[str] = []
+
+    # Walk through text, finding maximal-munch matches.
+    i = 0
+    n = len(text)
+    while i < n:
+        # Skip non-Title-Case characters until we find a Title Case word.
+        # word_spans is sorted by start position.
+        first_match = None
+        for ws_start, ws_end, ws_word in word_spans:
+            if ws_start >= i:
+                first_match = (ws_start, ws_end, ws_word)
+                break
+        if first_match is None:
+            break
+
+        # Try phrases from longest (4 words) down to shortest (1 word).
+        # At each length, check if the title index has that phrase.
+        matched = False
+        max_words = min(_MAX_PHRASE_WORDS, len(word_spans))
+
+        # Find word_spans that start at or after first_match[0].
+        relevant = [w for w in word_spans if w[0] >= first_match[0]]
+
+        for n_words in range(max_words, 0, -1):
+            if len(relevant) < n_words:
+                continue
+            # The first n_words of relevant must be the contiguous
+            # Title Case words from first_match onwards. That is,
+            # word_spans[1] must immediately follow word_spans[0]
+            # (no large gap), and word_spans[1:1+n_words] must each
+            # be tightly packed.
+            first = relevant[0]
+            last = relevant[n_words - 1]
+            # Check contiguity: each pair of consecutive words must
+            # be reasonably close in the source text (allowing for
+            # particles like "da" or commas).
+            contiguous = True
+            for j in range(n_words - 1):
+                w_a = relevant[j]
+                w_b = relevant[j + 1]
+                # The text between w_a and w_b must be short and contain
+                # only spaces, commas, or particle words (handled by
+                # the regex matching them as Title Case words).
+                gap = text[w_a[1]:w_b[0]]
+                # Allow up to 30 chars of "filler" between words.
+                # In practice this means: space, comma, "and", "or",
+                # "the", or particle words like "da"/"de" (which the
+                # regex matches and consumes anyway, so the gap here
+                # is just " " or "").
+                if len(gap) > 30 or any(c not in " ,.;:!?" for c in gap.strip()):
+                    contiguous = False
+                    break
+            if not contiguous:
+                continue
+            # Build the phrase string.
+            phrase_words = [w[2] for w in relevant[:n_words]]
+            phrase = " ".join(phrase_words)
+            # For lookup: try the phrase with trailing punctuation first
+            # (some titles have it, e.g., "Minimoni Seal Harun da
+            # Pyon!"), then without. This handles both cases without
+            # affecting titles that have no trailing punctuation.
+            keys_to_try = [phrase]
+            if phrase.endswith(("!", "?")):
+                keys_to_try.append(phrase.rstrip("!?"))
+            page_id = None
+            matched_canonical = None
+            for key in keys_to_try:
+                pid = title_index.get(key.lower())
+                if pid is not None:
+                    # Apply skiplist: skip common English words that
+                    # happen to be in the wiki (months, days, etc.)
+                    # even though the title index matches them. These
+                    # are almost never what the user wants linked.
+                    if key in _LINK_SKIPLIST:
+                        continue
+                    page_id = pid
+                    matched_canonical = key
+                    break
+            if page_id is not None:
+                results.append(matched_canonical)
+                # Advance past the matched phrase.
+                i = last[1]
+                matched = True
+                break
+
+        if not matched:
+            # No match at this position. Skip to the start of the next
+            # Title Case word (or just advance one char if no more).
+            i = first_match[1]
+
+    return results
 
 
 def extract_meta(tool_result: dict, db_path: Path | None = None) -> dict:

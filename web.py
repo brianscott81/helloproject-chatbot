@@ -269,10 +269,10 @@ class ChatHandler(BaseHTTPRequestHandler):
         except Exception as e:
             answer = f"Error: {e}"
 
-        # Extract entities and sources from the captured tool result.
-        # If the tool errored (no result), we still return a 200 with empty
-        # meta so the client gets a clean response shape.
-        meta = {"entities": [], "sources": []}
+        # First-pass extraction: structured entities and sources from the
+        # tool result (albums, songs, producers, members from infoboxes,
+        # page IDs from chunks). Fast and deterministic.
+        meta: dict = {"entities": [], "sources": []}
         if "result" in tool_result_holder:
             try:
                 from chat_meta import extract_meta
@@ -283,6 +283,25 @@ class ChatHandler(BaseHTTPRequestHandler):
                 # Meta extraction is best-effort; never fail the response
                 # because of meta issues.
                 pass
+
+        # Second-pass extraction: scan the LLM's answer prose for
+        # additional entity names (other groups, places, people mentioned
+        # in the response but not in the structured tool data). Each
+        # candidate is resolved to a wiki page via the DB.
+        #
+        # Examples:
+        #   - "Hello! Project" mentioned in a Minimoni answer
+        #   - "Yaguchi Mari" in a member list that wasn't in any chunk
+        #   - "Coconuts Musume", "W", "ZYX" in a group affiliations list
+        try:
+            from chat_meta import extract_entities_from_prose
+            extra = extract_entities_from_prose(
+                answer, self.server_db_path,
+                existing_entities=meta.get("entities", []),
+            )
+            meta["entities"].extend(extra)
+        except Exception:
+            pass
 
         self._send_json(200, {
             "answer": answer,

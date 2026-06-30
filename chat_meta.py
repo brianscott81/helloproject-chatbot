@@ -91,6 +91,19 @@ _MEMBER_BULLET_PATTERN = re.compile(
 )
 
 
+# Patterns for scanning the LLM's response text for entity names. We
+# look for 1-3 Title-Case words, optionally with internal '!' or '?'
+# (e.g., "Hello! Project"). Periods are NOT included because they
+# would let the regex bridge across sentence boundaries (e.g.,
+# "Morning Musume. The"). The DB lookup filters out non-entities
+# like "April", "Tokyo", "Japan", so false positives don't surface.
+_PROSE_ENTITY_PATTERN = re.compile(
+    r"\b([A-Z][a-zA-Z]+(?:[!?][!?]?)?"
+    r"(?: [A-Z][a-zA-Z]+(?:[!?][!?]?)?){0,2}"
+    r")\b"
+)
+
+
 def _extract_candidate_names_from_text(text: str, section: str = "") -> list[str]:
     """Pull candidate entity names from chunk text.
 
@@ -111,6 +124,59 @@ def _extract_candidate_names_from_text(text: str, section: str = "") -> list[str
             candidates.append(name)
 
     return candidates
+
+
+# Common English words that often appear at the start of candidate
+# matches but aren't really entities. Skipping these avoids linking
+# things like "April 2004" (date), "Tokyo, Japan" (place), "Members:"
+# (header), or "All four were..." (pronoun).
+# Some entries are common words that the wiki happens to have pages
+# for (e.g., "Japan", "HiP", "W") that the resolver would link to.
+_PROSE_STOPLIST = frozenset({
+    "All", "April", "August", "December", "February", "Friday",
+    "HiP", "Hip", "How", "I", "It", "January", "July", "June",
+    "March", "May", "Members", "Monday", "November", "October",
+    "September", "Saturday", "Some", "Sunday", "Tell", "The", "They",
+    "This", "Thursday", "Tokyo", "Tuesday", "W", "Want", "Wednesday",
+    "We", "What", "When", "Where", "Why", "Yes", "You",
+    "Japan", "Japanese",
+})
+
+
+def _extract_candidate_names_from_prose(text: str) -> list[str]:
+    """Pull candidate entity names from free-form prose (LLM response).
+
+    Scans for 1-3 Title-Case words. Single-word candidates must be at
+    least 3 characters long to avoid noise like "W", "the", "of" —
+    but this still catches single-word entities like "ZYX" and
+    "Tanpopo". Each candidate is resolved to a wiki page via the DB,
+    and DB misses are filtered out.
+
+    Common English words (months, days, pronouns, etc.) are skipped
+    via a stoplist to avoid linking dates, places, and sentence-starts.
+
+    Returns a list of unique candidate strings, longest first (so we
+    prefer "Morning Musume" over "Morning" when both match).
+    """
+    if not text:
+        return []
+    matches = _PROSE_ENTITY_PATTERN.findall(text)
+    # Dedupe case-insensitively, keeping longest
+    seen_lower: dict[str, str] = {}
+    for m in matches:
+        m = m.strip().rstrip(".,;:!?")
+        # Filter out very short single-word candidates (likely noise).
+        if " " not in m and len(m) < 3:
+            continue
+        # Skip if the candidate's first word is a common English word.
+        first_word = m.split()[0]
+        if first_word in _PROSE_STOPLIST:
+            continue
+        key = m.lower()
+        if key not in seen_lower or len(m) > len(seen_lower[key]):
+            seen_lower[key] = m
+    # Sort by length descending so longer matches are tried first
+    return sorted(seen_lower.values(), key=len, reverse=True)
 
 
 def _add_entity(entities: list[dict], seen: set,
@@ -147,6 +213,78 @@ def _add_entity(entities: list[dict], seen: set,
     if page_id is not None:
         entry["url"] = _wiki_url(name)
     entities.append(entry)
+
+
+def extract_entities_from_prose(
+    text: str,
+    db_path: Path | None = None,
+    existing_entities: list[dict] | None = None,
+) -> list[dict]:
+    """Extract additional entities from the LLM's response text.
+
+    Scans for Title Case word patterns (1-3 capitalized words). Each
+    candidate is resolved to a wiki page via the DB. Names that don't
+    resolve (e.g., "April", "Tokyo", "Japan") are filtered out.
+
+    This is a second pass that runs AFTER synthesis, complementing
+    extract_meta which runs on the structured tool result. Together
+    they catch both:
+
+      - Names from the structured tool data (albums, songs, producers,
+        members) — caught by extract_meta
+      - Names mentioned only in the LLM's prose (other groups, places,
+        etc.) — caught by this function
+
+    Returns a list of {name, type, page_id, url}. The type is generic
+    "page" for these; we don't try to classify them further (the
+    linkify doesn't care about type, just name + page_id).
+    """
+    if not text or db_path is None or not db_path.exists():
+        return []
+
+    candidates = _extract_candidate_names_from_prose(text)
+
+    # Build a set of page_ids and names already extracted so we skip them.
+    existing_page_ids: set[int] = set()
+    existing_names_lower: set[str] = set()
+    for e in (existing_entities or []):
+        if e.get("page_id") is not None:
+            existing_page_ids.add(e["page_id"])
+        if e.get("name"):
+            existing_names_lower.add(e["name"].lower())
+
+    entities: list[dict] = []
+    seen_page_ids: set[int] = set()
+    seen_names: set[str] = set()
+
+    try:
+        with connect(db_path) as conn:
+            for cand in candidates:
+                # Skip if already covered
+                if cand.lower() in existing_names_lower:
+                    continue
+                page = resolve_title(conn, cand)
+                if not page:
+                    continue
+                # Skip if already covered by page_id
+                if page.id in existing_page_ids or page.id in seen_page_ids:
+                    continue
+                if page.title.lower() in seen_names:
+                    continue
+                seen_page_ids.add(page.id)
+                seen_names.add(page.title.lower())
+                entities.append({
+                    "name": page.title,
+                    "type": "page",
+                    "page_id": page.id,
+                    "url": _wiki_url(page.title),
+                })
+                if len(entities) >= _MAX_ENTITIES:
+                    break
+    except Exception:
+        pass  # best-effort
+
+    return entities
 
 
 def extract_meta(tool_result: dict, db_path: Path | None = None) -> dict:

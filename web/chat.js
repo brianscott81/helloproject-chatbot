@@ -9,6 +9,10 @@
  * - "New Chat" button clears the local history and the visible chat
  * - "?" button shows the help modal
  * - Renders assistant Markdown via marked.js
+ * - Wraps entity names (artists, albums, songs, etc.) in clickable
+ *   links that send a "Tell me about X" prompt
+ * - Shows a "Sources" section at the bottom of assistant responses
+ *   with links to the Fandom wiki
  *
  * Per the user's spec: the web UI hides historical chats by default.
  * Each browser (or browser tab, after a refresh) starts with an
@@ -41,9 +45,8 @@
   const helpList = document.getElementById("help-list");
 
   // ---- State (in-memory, mirrored to localStorage) ----
-  // conversationHistory is a list of {role, content} objects.
-  // It is sent with each /api/chat request as prior_turns, so the
-  // server sees the full context but stores nothing.
+  // conversationHistory is a list of {role, content, entities?, sources?}
+  // objects. entities and sources are only on assistant turns.
   const STORAGE_KEY = "helloproject-wiki-chat-history-v1";
   let conversationHistory = loadHistory();
 
@@ -64,7 +67,6 @@
           typeof t.content === "string"
       );
     } catch (e) {
-      // Corrupt localStorage data — start fresh.
       return [];
     }
   }
@@ -76,7 +78,6 @@
       localStorage.setItem(STORAGE_KEY, JSON.stringify(trimmed));
     } catch (e) {
       // localStorage might be full or disabled (private mode).
-      // Best-effort only.
     }
   }
 
@@ -93,16 +94,126 @@
 
   function renderMarkdown(text) {
     if (window.marked) {
-      // marked.parse can return a string. We use it raw — the assistant's
-      // response is treated as semi-trusted Markdown (rendered server-side
-      // from a closed wiki dataset).
       return marked.parse(text);
     }
     return "<pre>" + escapeHtml(text) + "</pre>";
   }
 
-  function appendMessage(role, content) {
-    // Hide the empty-state once a real message is shown.
+  // ---- Entity linking ----
+  // Walk all text nodes inside the assistant bubble. For each text node,
+  // replace plain-text occurrences of entity names with <a class="entity-link">
+  // tags. We use TreeWalker so we never touch attribute values or tags.
+
+  function linkifyEntities(rootEl, entities) {
+    if (!entities || entities.length === 0) return;
+
+    // Build a regex from entity names. Longer names first so we don't
+    // match "Morning" before "Morning Musume". Escape regex specials.
+    const sorted = entities
+      .filter((e) => e && e.name && e.name.length >= 2)
+      .slice()
+      .sort((a, b) => b.name.length - a.name.length);
+    if (sorted.length === 0) return;
+
+    // Build a map of normalized-name -> entity for quick lookup
+    const entityByName = new Map();
+    for (const e of sorted) {
+      entityByName.set(e.name.toLowerCase(), e);
+    }
+    // Pattern: any entity name, word-boundary aware (so we don't link
+    // "Morning" inside "Mornings"). Case-sensitive matching.
+    const pattern = new RegExp(
+      "\\b(" + sorted.map((e) => escapeRegex(e.name)).join("|") + ")\\b",
+      "g"
+    );
+
+    // Collect text nodes to modify. We can't mutate the tree while walking,
+    // so we collect targets first, then replace.
+    const walker = document.createTreeWalker(rootEl, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        // Skip text inside <a>, <code>, <pre>, <script>, <style>
+        let p = node.parentNode;
+        while (p && p !== rootEl) {
+          const tag = p.tagName && p.tagName.toLowerCase();
+          if (tag === "a" || tag === "code" || tag === "pre"
+              || tag === "script" || tag === "style") {
+            return NodeFilter.FILTER_REJECT;
+          }
+          p = p.parentNode;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+    const textNodes = [];
+    let n;
+    while ((n = walker.nextNode())) {
+      // Only process nodes that actually contain an entity name
+      if (pattern.test(n.nodeValue)) {
+        textNodes.push(n);
+        pattern.lastIndex = 0;  // reset after test()
+      }
+    }
+
+    for (const node of textNodes) {
+      const text = node.nodeValue;
+      const frag = document.createDocumentFragment();
+      let lastIndex = 0;
+      pattern.lastIndex = 0;
+      let m;
+      while ((m = pattern.exec(text)) !== null) {
+        const before = text.slice(lastIndex, m.index);
+        if (before) frag.appendChild(document.createTextNode(before));
+        const matchedName = m[1];
+        const entity = entityByName.get(matchedName.toLowerCase());
+        const a = document.createElement("a");
+        a.className = "entity-link entity-" + (entity ? entity.type : "other");
+        a.href = "#";
+        a.textContent = matchedName;
+        a.dataset.entityName = matchedName;
+        if (entity) a.dataset.entityType = entity.type;
+        frag.appendChild(a);
+        lastIndex = m.index + matchedName.length;
+      }
+      const after = text.slice(lastIndex);
+      if (after) frag.appendChild(document.createTextNode(after));
+      node.parentNode.replaceChild(frag, node);
+    }
+  }
+
+  function escapeRegex(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  // ---- Sources section ----
+
+  function appendSourcesSection(wrap, sources) {
+    if (!sources || sources.length === 0) return;
+    const sec = document.createElement("div");
+    sec.className = "sources";
+    const heading = document.createElement("div");
+    heading.className = "sources-heading";
+    heading.textContent = "Sources";
+    sec.appendChild(heading);
+    const list = document.createElement("ul");
+    list.className = "sources-list";
+    for (const s of sources) {
+      const li = document.createElement("li");
+      const a = document.createElement("a");
+      a.href = s.url || "#";
+      a.target = "_blank";
+      a.rel = "noopener noreferrer";
+      a.textContent = s.title || s.url || "Source";
+      li.appendChild(a);
+      list.appendChild(li);
+    }
+    sec.appendChild(list);
+    wrap.appendChild(sec);
+  }
+
+  // ---- Render ----
+
+  function appendMessage(role, content, opts) {
+    opts = opts || {};
     if (emptyStateEl && !emptyStateEl.hidden) {
       emptyStateEl.hidden = true;
     }
@@ -111,11 +222,23 @@
     const bubble = document.createElement("div");
     bubble.className = "bubble " + role;
     if (role === "user") {
-      bubble.textContent = content;  // text only for user input
+      bubble.textContent = content;
     } else {
+      // Render markdown first, then linkify entities inside the rendered HTML.
+      // We set innerHTML (not textContent) here because marked.js output is
+      // trusted: it comes from the LLM which we treat as semi-trusted.
       bubble.innerHTML = renderMarkdown(content);
+      // Walk text nodes and wrap entity names in <a> tags.
+      if (opts.entities && opts.entities.length > 0) {
+        linkifyEntities(bubble, opts.entities);
+      }
     }
     wrap.appendChild(bubble);
+    // Sources go below the bubble but inside the message wrapper, so the
+    // styling is per-message.
+    if (role === "assistant" && opts.sources && opts.sources.length > 0) {
+      appendSourcesSection(wrap, opts.sources);
+    }
     messagesEl.appendChild(wrap);
     messagesEl.scrollTop = messagesEl.scrollHeight;
     return bubble;
@@ -172,12 +295,9 @@
   }
 
   // ---- Render history on page load ----
-  // When the user reloads the page, the conversation is restored
-  // from localStorage and re-rendered. This is the "persistence
-  // across reloads" behavior the spec asked for.
+
   function renderHistory() {
     if (conversationHistory.length === 0) {
-      // Show the empty state
       if (emptyStateEl) {
         emptyStateEl.hidden = false;
         if (messagesEl.firstChild !== emptyStateEl) {
@@ -186,12 +306,18 @@
       }
       return;
     }
-    // Hide the empty state
     if (emptyStateEl) {
       emptyStateEl.hidden = true;
     }
     for (const turn of conversationHistory) {
-      appendMessage(turn.role, turn.content);
+      if (turn.role === "user") {
+        appendMessage("user", turn.content);
+      } else {
+        appendMessage("assistant", turn.content, {
+          entities: turn.entities || [],
+          sources: turn.sources || [],
+        });
+      }
     }
   }
 
@@ -205,11 +331,7 @@
     inFlight = true;
     sendBtn.disabled = true;
 
-    // Render the user message immediately
     appendMessage("user", q);
-
-    // Add to history (this is the in-memory list that the server
-    // sees as prior_turns on the next request)
     conversationHistory.push({ role: "user", content: q });
     saveHistory();
 
@@ -218,17 +340,22 @@
 
     const typing = appendTyping();
     try {
-      // Send question + the conversation history. The server is
-      // stateless; the prior_turns is the only context it sees.
       const data = await postJson("/api/chat", {
         question: q,
-        prior_turns: conversationHistory.slice(0, -1),  // exclude current turn
+        prior_turns: conversationHistory.slice(0, -1),
       });
       typing.remove();
-      appendMessage("assistant", data.answer);
+      appendMessage("assistant", data.answer || "", {
+        entities: data.entities || [],
+        sources: data.sources || [],
+      });
 
-      // Add the assistant turn to history
-      conversationHistory.push({ role: "assistant", content: data.answer });
+      conversationHistory.push({
+        role: "assistant",
+        content: data.answer || "",
+        entities: data.entities || [],
+        sources: data.sources || [],
+      });
       saveHistory();
     } catch (e) {
       typing.remove();
@@ -247,9 +374,16 @@
     input.style.height = Math.min(input.scrollHeight, 200) + "px";
   }
 
-  // ---- New Chat ----
-  // Clears the local conversation history and the visible chat.
-  // There's no server-side state to clear.
+  // ---- "Tell me about X" prompts ----
+  // When the user clicks an entity link, send a pre-filled prompt.
+  // We use preventDefault to stop the browser from following the href.
+  function askAbout(name) {
+    if (inFlight) return;
+    input.value = "Tell me about " + name;
+    autoSize();
+    sendQuestion();
+  }
+
   function newChat() {
     if (inFlight) return;
     if (conversationHistory.length > 0
@@ -287,6 +421,16 @@
     if (e.target === helpModal) helpModal.classList.add("hidden");
   });
 
+  // Delegated click handler on the messages container. If a click lands
+  // on an .entity-link, intercept and ask about it.
+  messagesEl.addEventListener("click", (e) => {
+    const a = e.target.closest && e.target.closest("a.entity-link");
+    if (a && a.dataset && a.dataset.entityName) {
+      e.preventDefault();
+      askAbout(a.dataset.entityName);
+    }
+  });
+
   input.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -305,7 +449,6 @@
     });
   }
 
-  // Render any history from a previous session, then focus the input
   renderHistory();
   input.focus();
 })();

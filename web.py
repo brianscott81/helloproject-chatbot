@@ -244,6 +244,17 @@ class ChatHandler(BaseHTTPRequestHandler):
             format_prior_turns_for_llm(validated_turns) if validated_turns else None
         )
 
+        # Capture the tool result via on_tool_complete so we can extract
+        # entities and sources for the web UI to render as clickable links.
+        # on_tool_complete is called by answer_question() after the tool
+        # executes but before LLM synthesis. This is the documented hook
+        # for inspecting tool output without re-running the tool.
+        tool_result_holder: dict[str, Any] = {}
+
+        def _on_tool_complete(call: dict, result: dict) -> None:
+            tool_result_holder["call"] = call
+            tool_result_holder["result"] = result
+
         try:
             answer = chat.answer_question(
                 question,
@@ -253,11 +264,31 @@ class ChatHandler(BaseHTTPRequestHandler):
                 llm=self.server_llm,
                 prior_turns_str=prior_turns_str,
                 use_llm_tool_fallback=self.server_use_llm_tool_fallback,
+                on_tool_complete=_on_tool_complete,
             )
         except Exception as e:
             answer = f"Error: {e}"
 
-        self._send_json(200, {"answer": answer})
+        # Extract entities and sources from the captured tool result.
+        # If the tool errored (no result), we still return a 200 with empty
+        # meta so the client gets a clean response shape.
+        meta = {"entities": [], "sources": []}
+        if "result" in tool_result_holder:
+            try:
+                from chat_meta import extract_meta
+                meta = extract_meta(
+                    tool_result_holder["result"], self.server_db_path,
+                )
+            except Exception:
+                # Meta extraction is best-effort; never fail the response
+                # because of meta issues.
+                pass
+
+        self._send_json(200, {
+            "answer": answer,
+            "entities": meta.get("entities", []),
+            "sources": meta.get("sources", []),
+        })
 
 
 # ---------------------------------------------------------------------------
